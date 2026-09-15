@@ -1,0 +1,645 @@
+{
+  "master": {
+    "tasks": [
+      {
+        "id": "2",
+        "title": "Initialize Node.js Project Structure",
+        "description": "Set up the basic Node.js project structure with TypeScript configuration, package.json, and essential dependencies",
+        "details": "Create package.json with Node.js 18+ requirement, install TypeScript, @types/node, and MCP SDK dependencies. Set up tsconfig.json with strict mode and ES2022 target. Create src/ directory structure with handlers/, mcp/, services/, types/, utils/ subdirectories. Initialize .gitignore with node_modules, dist/, .env, plans/, prompt_logs/.",
+        "testStrategy": "Verify project builds successfully with 'npm run build', TypeScript compilation passes without errors, and all required directories exist",
+        "priority": "high",
+        "dependencies": [],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:05:53.574Z"
+      },
+      {
+        "id": "3",
+        "title": "Implement Environment Configuration System",
+        "description": "Create configuration management for Autotask API credentials and server settings using environment variables",
+        "details": "Create config.ts in utils/ to load and validate environment variables: AUTOTASK_USERNAME, AUTOTASK_SECRET, AUTOTASK_INTEGRATION_CODE (required), AUTOTASK_API_URL, MCP_SERVER_NAME, MCP_SERVER_VERSION, LOG_LEVEL, LOG_FORMAT, NODE_ENV (optional). Use dotenv for .env file support. Implement validation with descriptive error messages for missing required variables.",
+        "testStrategy": "Unit tests for config validation with missing/present environment variables, verify default values are applied correctly",
+        "priority": "high",
+        "dependencies": [
+          "2"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:05:55.434Z"
+      },
+      {
+        "id": "4",
+        "title": "Set up Structured Logging System",
+        "description": "Implement configurable logging with support for different levels and formats (simple/JSON)",
+        "details": "Create logger.ts in utils/ using winston or similar library. Support LOG_LEVEL (error, warn, info, debug) and LOG_FORMAT (simple, json). Simple format for development console output, JSON format for production structured logging. Include timestamp, level, message, and optional metadata fields.",
+        "testStrategy": "Test different log levels are filtered correctly, JSON format produces valid JSON, simple format is human-readable",
+        "priority": "medium",
+        "dependencies": [
+          "3"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:05:57.023Z"
+      },
+      {
+        "id": "5",
+        "title": "Create Autotask API Service Layer",
+        "description": "Implement the core Autotask API client with authentication and basic CRUD operations",
+        "details": "Create autotask-service.ts in services/ directory. Implement AutotaskService class with methods for authentication using username/secret/integration code. Add methods for companies, contacts, tickets, time entries with GET, POST, PUT operations. Use axios for HTTP requests with proper error handling and timeout configuration. Include retry logic for transient failures.",
+        "testStrategy": "Unit tests with mocked HTTP responses, integration tests with test Autotask instance if available, test authentication flow and error handling",
+        "priority": "high",
+        "dependencies": [
+          "4"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:05:58.728Z"
+      },
+      {
+        "id": "6",
+        "title": "Implement ID-to-Name Mapping System",
+        "description": "Create intelligent caching system for resolving company and resource IDs to human-readable names",
+        "details": "Create mapping-service.ts with MappingService class. Implement in-memory cache with 30-minute TTL for company and resource name lookups. Add methods: getCompanyName(id), getResourceName(id), clearCache(), preloadCache(), getCacheStats(). Use Map for storage with automatic cleanup. Support bulk operations for efficient batch lookups with parallel processing.",
+        "testStrategy": "Test cache hit/miss scenarios, TTL expiration, bulk lookup performance, graceful fallback for unknown IDs",
+        "priority": "medium",
+        "dependencies": [
+          "5"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:00.376Z"
+      },
+      {
+        "id": "7",
+        "title": "Define TypeScript Types and Interfaces",
+        "description": "Create comprehensive type definitions for Autotask entities and MCP protocol structures",
+        "details": "Create types/ directory with interfaces for Company, Contact, Ticket, TimeEntry, Resource entities matching Autotask API schema. Add MCP-specific types for tools, resources, and responses. Include enhanced entity types with _enhanced field for ID-to-name mappings. Use strict typing with required/optional field annotations.",
+        "testStrategy": "TypeScript compilation validates all types, test type compatibility with actual API responses",
+        "priority": "medium",
+        "dependencies": [
+          "2"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:03.165Z"
+      },
+      {
+        "id": "8",
+        "title": "Implement MCP Server Core",
+        "description": "Create the main MCP server implementation with protocol compliance and request routing",
+        "details": "Create mcp-server.ts in mcp/ directory implementing MCP protocol. Handle initialize, list_resources, list_tools, call_tool, read_resource requests. Set up proper JSON-RPC 2.0 message handling with error responses. Include server capabilities declaration and version negotiation. Use @modelcontextprotocol/sdk if available or implement protocol manually.",
+        "testStrategy": "Test MCP protocol compliance, message parsing/serialization, error handling for malformed requests",
+        "priority": "high",
+        "dependencies": [
+          "7"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:05.105Z"
+      },
+      {
+        "id": "9",
+        "title": "Create MCP Resource Handlers",
+        "description": "Implement MCP resource handlers for read-only access to Autotask data",
+        "details": "Create resource-handlers.ts in handlers/ directory. Implement handlers for autotask://companies, autotask://companies/{id}, autotask://contacts, autotask://contacts/{id}, autotask://tickets, autotask://tickets/{id}, autotask://time-entries resources. Each handler should return properly formatted MCP resource responses with content and metadata.",
+        "testStrategy": "Test resource URI parsing, data retrieval and formatting, error handling for invalid IDs",
+        "priority": "medium",
+        "dependencies": [
+          "8",
+          "5"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:06.801Z"
+      },
+      {
+        "id": "10",
+        "title": "Implement Company Management Tools",
+        "description": "Create MCP tools for company search, creation, and update operations",
+        "details": "Create company-tools.ts in handlers/ with search_companies, create_company, update_company tools. search_companies supports searchTerm, isActive, pageSize parameters with filtering. create_company accepts company data and returns created entity. update_company modifies existing company. All tools include ID-to-name enhancement in responses.",
+        "testStrategy": "Test search filtering, company creation with required fields, update operations, enhanced response format",
+        "priority": "medium",
+        "dependencies": [
+          "8",
+          "5",
+          "6"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:08.494Z"
+      },
+      {
+        "id": "11",
+        "title": "Implement Contact Management Tools",
+        "description": "Create MCP tools for contact search and creation operations",
+        "details": "Create contact-tools.ts in handlers/ with search_contacts and create_contact tools. search_contacts supports filtering by email, company, name with pagination. create_contact accepts contact data including companyID association. Include automatic company name resolution in responses using mapping service.",
+        "testStrategy": "Test contact search with various filters, contact creation with company association, enhanced response with company names",
+        "priority": "medium",
+        "dependencies": [
+          "8",
+          "5",
+          "6"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:10.078Z"
+      },
+      {
+        "id": "12",
+        "title": "Implement Ticket Management Tools",
+        "description": "Create MCP tools for ticket search and creation operations",
+        "details": "Create ticket-tools.ts in handlers/ with search_tickets and create_ticket tools. search_tickets supports filtering by status, priority, assignee, company with pagination. create_ticket accepts companyID, title, description, priority, status parameters. Include automatic resolution of companyID and assignedResourceID to names in responses.",
+        "testStrategy": "Test ticket search with complex filters, ticket creation with required fields, enhanced responses with resolved names",
+        "priority": "medium",
+        "dependencies": [
+          "8",
+          "5",
+          "6"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:12.669Z"
+      },
+      {
+        "id": "13",
+        "title": "Implement Time Entry Management Tools",
+        "description": "Create MCP tools for time entry creation and management",
+        "details": "Create time-entry-tools.ts in handlers/ with create_time_entry tool. Accept parameters for ticketID, resourceID, hours, description, date. Validate time entry data and create entries in Autotask. Include enhanced responses with ticket and resource name resolution.",
+        "testStrategy": "Test time entry creation with valid/invalid data, ticket and resource ID validation, enhanced response format",
+        "priority": "medium",
+        "dependencies": [
+          "8",
+          "5",
+          "6"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:14.263Z"
+      },
+      {
+        "id": "14",
+        "title": "Implement Utility and Mapping Tools",
+        "description": "Create utility tools for connection testing and mapping cache management",
+        "details": "Create utility-tools.ts in handlers/ with test_connection, get_company_name, get_resource_name, get_mapping_cache_stats, clear_mapping_cache, preload_mapping_cache tools. test_connection verifies API connectivity. Mapping tools provide direct access to ID-to-name resolution and cache management.",
+        "testStrategy": "Test connection validation, individual name lookups, cache statistics accuracy, cache clearing functionality",
+        "priority": "low",
+        "dependencies": [
+          "8",
+          "5",
+          "6"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:15.929Z"
+      },
+      {
+        "id": "15",
+        "title": "Create Main Application Entry Point",
+        "description": "Implement the main index.ts file that initializes and starts the MCP server",
+        "details": "Create index.ts in src/ root that imports configuration, initializes logging, creates AutotaskService and MappingService instances, sets up MCP server with all handlers and tools, and starts the server. Include graceful shutdown handling and error recovery. Export main function for CLI usage.",
+        "testStrategy": "Test server startup/shutdown, configuration loading, service initialization, error handling during startup",
+        "priority": "high",
+        "dependencies": [
+          "8",
+          "9",
+          "10",
+          "11",
+          "12",
+          "13",
+          "14"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:17.522Z"
+      },
+      {
+        "id": "16",
+        "title": "Create Docker Configuration",
+        "description": "Set up Docker containerization with Dockerfile and docker-compose.yml",
+        "details": "Create Dockerfile with Node.js 18+ base image, multi-stage build for production optimization. Copy package files, install dependencies, build TypeScript, and set up runtime. Create docker-compose.yml with autotask-mcp service and autotask-mcp-dev profile for development with volume mounts. Include .dockerignore for build optimization.",
+        "testStrategy": "Test Docker build process, container startup with environment variables, development mode with hot reload",
+        "priority": "medium",
+        "dependencies": [
+          "15"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:19.093Z"
+      },
+      {
+        "id": "17",
+        "title": "Implement Comprehensive Test Suite",
+        "description": "Create unit tests, integration tests, and API tests with 80%+ coverage requirement",
+        "details": "Set up Jest testing framework with TypeScript support. Create tests/ directory with unit tests for services, handlers, and utilities. Add integration tests for MCP protocol compliance. Include API tests for Autotask integration (with mocked responses). Set up coverage reporting with 80% minimum threshold for all metrics.",
+        "testStrategy": "Run test suite with 'npm test', verify coverage meets requirements, test both success and error scenarios",
+        "priority": "medium",
+        "dependencies": [
+          "15"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:22.042Z"
+      },
+      {
+        "id": "18",
+        "title": "Set up Development Scripts and Tooling",
+        "description": "Configure npm scripts, ESLint, and development workflow tools",
+        "details": "Add npm scripts in package.json: dev (development with hot reload), build (TypeScript compilation), test (run tests), test:watch, test:coverage, lint, lint:fix. Configure ESLint with TypeScript rules and Prettier integration. Set up nodemon for development hot reload.",
+        "testStrategy": "Test all npm scripts execute successfully, linting catches common issues, development mode restarts on file changes",
+        "priority": "low",
+        "dependencies": [
+          "17"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:23.763Z"
+      },
+      {
+        "id": "19",
+        "title": "Create CLI Interface and NPM Package Configuration",
+        "description": "Set up command-line interface and prepare package for NPM publication",
+        "details": "Add CLI entry point with shebang for global installation. Configure package.json with bin field pointing to built CLI script. Add keywords, repository, author, license fields. Create .npmignore to exclude development files. Set up package for global installation with 'npm install -g autotask-mcp'.",
+        "testStrategy": "Test global installation, CLI command execution, package metadata is correct",
+        "priority": "medium",
+        "dependencies": [
+          "18"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:26.868Z"
+      },
+      {
+        "id": "20",
+        "title": "Create Documentation and Examples",
+        "description": "Generate comprehensive documentation including Claude Desktop integration guide",
+        "details": "Create QUICK_START_CLAUDE.md with step-by-step Claude Desktop setup. Add API documentation with example tool usage. Create .env.example template. Document Docker deployment options. Add troubleshooting guide with common issues and solutions. Include example MCP client configurations for different deployment methods.",
+        "testStrategy": "Verify all documentation examples work correctly, configuration templates are valid, troubleshooting steps resolve common issues",
+        "priority": "low",
+        "dependencies": [
+          "19"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:29.614Z"
+      },
+      {
+        "id": "21",
+        "title": "Set up CI/CD Pipeline and GitHub Container Registry",
+        "description": "Configure GitHub Actions for automated testing, building, and publishing to GitHub Container Registry",
+        "details": "Create .github/workflows/ci.yml for automated testing on pull requests. Add build-and-publish.yml workflow for creating Docker images and publishing to ghcr.io/asachs01/autotask-mcp. Include automated NPM package publishing on releases. Set up semantic versioning and changelog generation.",
+        "testStrategy": "Test CI pipeline runs on commits, Docker images build and publish correctly, NPM package publishes on release",
+        "priority": "low",
+        "dependencies": [
+          "20"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:31.544Z"
+      },
+      {
+        "id": "22",
+        "title": "Design and Document Intelligent Workflow Tools Architecture",
+        "description": "Create comprehensive architecture design and documentation for intelligent workflow tools including Analytics, Workflows, Contextual Search, and Smart Actions with MCP elicitation support.",
+        "details": "Design a modular architecture with four core components: 1) Analytics Module - Create profitability analysis engine with trend detection algorithms, high-touch customer identification using interaction frequency and value metrics, revenue attribution models, and dashboard visualization specs. 2) Workflows Module - Design onboarding automation with step-by-step customer journey mapping, escalation routing based on priority matrices and SLA requirements, intelligent ticket routing using machine learning classification. 3) Contextual Search Module - Architect customer 360-degree view aggregating data from multiple sources (tickets, interactions, billing), technician workload balancing with capacity planning and skill matching algorithms. 4) Smart Actions Module - Design MCP elicitation framework for interactive decision-making with conversation flows, decision trees, and action recommendation engine. Create detailed system diagrams showing data flow, API interfaces, database schemas, and integration points. Document microservices architecture with clear separation of concerns, event-driven communication patterns, and scalability considerations. Include security architecture with authentication, authorization, and data privacy controls.",
+        "testStrategy": "Create architecture review checklist covering scalability, security, and maintainability requirements. Validate system diagrams against functional requirements. Review API specifications for completeness and consistency. Conduct stakeholder review sessions to ensure business requirements alignment. Create proof-of-concept implementations for critical components to validate architectural decisions.",
+        "status": "done",
+        "dependencies": [
+          "6",
+          "20"
+        ],
+        "priority": "high",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:34.290Z"
+      },
+      {
+        "id": "23",
+        "title": "Implement Analytics Service Layer",
+        "description": "Create AnalyticsService class with methods for customer profitability analysis, ticket trend detection, high-touch customer identification, and resource capacity forecasting.",
+        "details": "Create analytics-service.ts in services/ directory implementing AnalyticsService class. Implement customerProfitabilityAnalysis() method that calculates revenue per customer using time entries, ticket costs, and contract values with configurable date ranges. Add ticketTrendDetection() method using moving averages and statistical analysis to identify patterns in ticket volume, resolution times, and priority distributions. Implement identifyHighTouchCustomers() method that analyzes interaction frequency, ticket volume, and support hours to score customers using weighted metrics. Create resourceCapacityForecasting() method that analyzes historical workload data, current assignments, and utilization rates to predict capacity needs. Include data aggregation utilities for time-series analysis, statistical calculations for trend detection, and caching mechanisms for expensive computations. Use the existing AutotaskService for data retrieval and MappingService for ID-to-name resolution. Implement proper error handling and logging throughout all analytics methods.",
+        "testStrategy": "Create unit tests for each analytics method with mocked data scenarios covering various customer profiles, ticket patterns, and resource utilization levels. Test profitability calculations with different time ranges and revenue models. Verify trend detection algorithms identify upward/downward patterns and seasonal variations. Test high-touch customer scoring with edge cases like new customers and inactive accounts. Validate capacity forecasting accuracy using historical data splits. Include performance tests for large datasets and verify caching mechanisms reduce computation time. Test error handling for missing data and invalid parameters.",
+        "status": "done",
+        "dependencies": [
+          "5",
+          "6"
+        ],
+        "priority": "high",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:36.156Z"
+      },
+      {
+        "id": "24",
+        "title": "Fix MaxRecords casing bug in autotask-node library",
+        "description": "Update all list() methods in autotask-node entity files to use 'maxRecords' (lowercase m) instead of 'MaxRecords' to match Autotask REST API expectations and fix pagination issues.",
+        "details": "Review and update the following confirmed files: src/entities/accounts.ts line 187, src/entities/contacts.ts line 197, src/entities/resources.ts line 183. Search entire src/entities/ directory for all other .ts files containing 'MaxRecords' in list() methods and replace with 'maxRecords'. Ensure the parameter is passed correctly in query parameters for pagination (e.g., { maxRecords: 500 }). Verify no other casing-sensitive parameters are affected by cross-referencing Autotask REST API documentation. Update any related type definitions or interfaces if 'MaxRecords' appears there. Commit changes with reference to GitHub Issues #3, #8, #9. Run full project build and linting after changes.",
+        "testStrategy": "Manually test list() methods on affected entities (Accounts, Contacts, Resources) with pagination by setting maxRecords to 10 and verifying API returns exactly 10 records without excessive calls. Test with larger values (500) to confirm pagination works end-to-end. Run integration tests against live Autotask API if available, monitoring API call counts. Verify no regressions in other entity list() methods by testing at least 5 unaffected entities. Confirm build succeeds and no TypeScript errors. Check GitHub Issues #3, #8, #9 are resolvable post-fix.",
+        "status": "done",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": [],
+        "updatedAt": "2026-01-20T21:15:11.654Z"
+      },
+      {
+        "id": "25",
+        "title": "Implement HTTP Streamable Transport for MCP Server",
+        "description": "Add HTTP Streamable transport option to the MCP server for remote access without mcp-proxy (GitHub Issue #7)",
+        "details": "Currently the autotask-mcp server only supports stdio transport which requires running on the same machine or using mcp-proxy. Users want HTTP Streamable transport to access the server remotely without additional proxy software. This is a feature request from GitHub Issue #7. Implementation should add an HTTP server mode using the MCP SDK's SSE transport capabilities. Add CLI flag (--http or --transport http) to enable HTTP mode with configurable host and port. Ensure environment variables work correctly in HTTP mode (Docker users report env vars being ignored).",
+        "testStrategy": "Test HTTP transport can be started with CLI flags. Verify MCP clients can connect over HTTP. Test environment variables are correctly loaded in HTTP mode. Test Docker deployment with HTTP transport enabled.",
+        "status": "done",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:47.959Z"
+      },
+      {
+        "id": "26",
+        "title": "Fix Search Filter Application in autotask-mcp Service",
+        "description": "Ensure search filters (searchTerm) are correctly converted to API filters and applied to queries (GitHub Issues #8, #9)",
+        "details": "The autotask.service.ts has partial fixes for converting searchTerm to API filters, but there are still issues where filters aren't being applied correctly. Logs show 'filter:[{field:id,op:gte,value:0}]' when a searchTerm should be filtering. Issues: 1) Resources endpoint was using incorrect GET with query params instead of POST query - may need verification this is fixed. 2) The 'items' vs 'value' syntax for OR filters may not match Autotask Swagger spec. 3) Filter construction in searchResources, searchContacts, searchCompanies needs review to ensure filters are passed through correctly to autotask-node. Verify the fixes added for Issue #8/#9 are working correctly end-to-end.",
+        "testStrategy": "Test search_contacts with searchTerm 'John Smith' returns only matching contacts, not all contacts. Test search_resources with email filter returns matching resource. Monitor API logs to verify correct filter syntax is being sent. Create integration tests with real or mocked API.",
+        "status": "done",
+        "dependencies": [
+          "24"
+        ],
+        "priority": "high",
+        "subtasks": [],
+        "updatedAt": "2026-01-20T21:22:00.787Z"
+      },
+      {
+        "id": "27",
+        "title": "Comprehensive Verification and Hardening of GitHub Issues #3, #8, #9 Fixes",
+        "description": "Review and verify fixes for GitHub Issues #3, #8, #9 including maxRecords casing in autotask-node, search filter implementation in autotask-mcp, and create integration tests for pagination, search filters, and POST /query endpoint usage.",
+        "details": "1. **Review maxRecords casing fix (Task 24)**: Confirm all 214 entity files in autotask-node/src/entities/ use 'maxRecords' (lowercase 'm') in list() methods by running grep -r 'MaxRecords' src/entities/ and verifying zero matches. Cross-reference Autotask REST API documentation to ensure parameter casing matches exactly. 2. **Verify search filter implementation in autotask-mcp service**: Review autotask-mcp service code handling search queries for contacts/companies/resources, confirm filters are applied server-side before Autotask API calls using proper query builders. Check that search uses POST /query endpoint exclusively (no GET /query or list endpoints for filtered results). 3. **Create integration test suite in tests/integration/**: Write end-to-end tests using Jest + Supertest or Playwright that: a) Test pagination with maxRecords=10, verify exactly 10 records returned and next page token works; b) Test search filters on contacts (e.g., name='John'), companies (e.g., industry='Tech'), resources (e.g., active=true) return correct filtered results; c) Verify all search/filter API calls use POST /query endpoint via network inspection or request logging; d) Create regression test cases that would have caught original Issues #3, #8, #9 (e.g., maxRecords casing mismatch returns zero results, search filters ignored, incorrect HTTP method). 4. **Documentation and commit hygiene**: Ensure all fixes have proper GitHub PRs with linked issues, comprehensive commit messages following conventional commits, and updated CHANGELOG.md. Add test README with reproduction steps for original bugs. 5. **Edge case coverage**: Test empty results, maxRecords=1, invalid filters, rate limiting scenarios.",
+        "testStrategy": "1. Run grep -r 'MaxRecords' autotask-node/src/entities/ -- expect 0 matches. 2. Execute integration tests: npm run test:integration -- expect 100% pass rate covering pagination (verify record counts match maxRecords), search filters (verify filtered vs unfiltered counts differ), endpoint verification (intercept requests confirm POST /query usage). 3. Run original bug reproduction tests -- expect all to FAIL on main branch but PASS on fixed branch. 4. Verify CI/CD runs successfully with full test suite + coverage >90%. 5. Manual end-to-end test: Deploy autotask-mcp, execute CLI search/paginate commands, confirm correct behavior and API traces show proper casing/endpoint/filtering. 6. Review Git history confirms all changes properly committed with semantic messages and issue references.",
+        "status": "done",
+        "dependencies": [
+          "24",
+          "17"
+        ],
+        "priority": "high",
+        "subtasks": [],
+        "updatedAt": "2026-01-21T17:06:49.544Z"
+      },
+      {
+        "id": "28",
+        "title": "Implement MCP Lazy Loading / Progressive Tool Discovery",
+        "description": "Add lazy loading support for MCP tools to reduce context overhead. Currently 35 tools are loaded upfront which consumes significant context tokens. Implement progressive discovery pattern.",
+        "details": "The autotask-mcp server exposes 35 tools which creates context overhead when all tool schemas are loaded upfront. Implement lazy loading using one of two approaches:\n\n**Option A: Server-Side Progressive Discovery (Recommended)**\nImplement a three-tool meta-interface inspired by mcp-dynamic-proxy:\n1. `autotask_list_categories` - Returns tool categories (Companies, Contacts, Tickets, TimeEntries, Resources, Utility) without full schemas\n2. `autotask_list_tools` - Returns tools for a specific category with full JSON schemas\n3. `autotask_execute_tool` - Proxies execution to the actual tool\n\nThis reduces initial context from 35 tools to 3 tools (97% reduction).\n\n**Option B: Client-Side Compatibility**\nEnsure compatibility with Claude Code's built-in MCP Tool Search feature which auto-detects when tools exceed 10% context and switches to on-demand discovery.\n\n**Implementation Steps:**\n1. Add tool categorization metadata to existing tools\n2. Create meta-tools for progressive discovery\n3. Add CLI flag `--lazy-loading` to enable/disable\n4. Update tool handler to support both modes\n5. Add documentation for lazy loading configuration\n6. Benchmark token usage before/after",
+        "testStrategy": "1. Measure baseline token usage with all 35 tools loaded. 2. Implement lazy loading and measure reduced token usage. 3. Test tool discovery flow: list_categories -> list_tools -> execute_tool. 4. Verify backward compatibility - existing direct tool calls still work. 5. Test with Claude Code MCP Tool Search enabled. 6. Performance benchmark: response time for tool discovery vs direct call.",
+        "status": "in-progress",
+        "dependencies": [
+          "25"
+        ],
+        "priority": "medium",
+        "subtasks": [],
+        "tags": [
+          "v1.2.0",
+          "feature",
+          "performance"
+        ],
+        "updatedAt": "2026-03-09T22:44:54.891Z"
+      },
+      {
+        "id": "29",
+        "title": "Implement Decision Tree Based Tool Routing",
+        "description": "Add intelligent tool routing using decision trees to automatically select appropriate tools based on user intent, reducing cognitive load and improving accuracy.",
+        "status": "pending",
+        "dependencies": [
+          "28"
+        ],
+        "priority": "medium",
+        "details": "Create a decision tree system that routes user requests to appropriate tools based on intent classification for v2.2.0 release following v2.0.0 tool namespacing breaking changes:\n\n**Decision Tree Structure:**\n```\nUser Intent\n├── Customer Lookup\n│   ├── By Name → search_companies / search_contacts\n│   ├── By ID → get_company / get_contact\n│   └── Create New → create_company / create_contact\n├── Ticket Management\n│   ├── Find Tickets → search_tickets\n│   ├── Create Ticket → create_ticket (requires: companyId, title)\n│   └── Update Ticket → update_ticket\n├── Time Tracking\n│   ├── Log Time → create_time_entry (requires: ticketId, hours)\n│   └── View Time → get_time_entries\n└── Resource Management\n    ├── Find Resource → search_resources\n    └── Resource Details → get_resource\n```\n\n**Implementation:**\n1. Create `autotask_router` meta-tool that accepts natural language intent\n2. Implement intent classifier (can use simple keyword matching or embeddings)\n3. Build decision tree with required/optional parameter mapping\n4. Add MCP elicitation support for missing required parameters (leverages Task 8: MCP Server Core)\n5. Return suggested tool + pre-filled parameters\n6. Support multi-step workflows (e.g., 'create ticket for Acme Corp' → search_companies → create_ticket)\n7. Integrate with existing services: ID-to-Name mapping (Task 6), Company/Contact tools (Tasks 10,11), Environment config (Task 3)\n\n**Example Flow:**\nUser: 'Log 2 hours on ticket 12345'\n→ Router identifies: Time Tracking → Log Time\n→ Extracts: ticketId=12345, hours=2\n→ Returns: {tool: 'create_time_entry', params: {ticketId: 12345, hours: 2}}",
+        "testStrategy": "1. Test intent classification accuracy with sample queries across all decision tree branches. 2. Verify decision tree correctly routes to expected tools post-v2.0.0 namespacing. 3. Test parameter extraction from natural language with ID-to-name resolution. 4. Test MCP elicitation for missing parameters using implemented MCP server. 5. Test multi-step workflow execution with company/contact lookups. 6. Validate integration with existing mapping service, company/contact tools, and config system. 7. Benchmark routing latency vs direct tool call under v2.2.0 tooling.",
+        "subtasks": []
+      },
+      {
+        "id": "30",
+        "title": "Add MCP Elicitation Support for Interactive Workflows",
+        "description": "Implement MCP elicitation protocol to enable interactive parameter collection when required tool parameters are missing.",
+        "details": "MCP elicitation allows servers to request additional information from users during tool execution. This is essential for:\n\n1. **Missing Required Parameters**: When a tool is called without required params (e.g., create_ticket without companyId)\n2. **Disambiguation**: When search results return multiple matches\n3. **Confirmation**: For destructive operations (delete, update)\n4. **Multi-Step Workflows**: Collecting parameters across multiple steps\n\n**Implementation:**\n1. Add elicitation support to tool handler\n2. Define elicitation schemas for each tool's required parameters\n3. Implement confirmation prompts for create/update/delete operations\n4. Add disambiguation UI for multiple search results\n5. Support conversation context for multi-turn interactions\n\n**Example Elicitation Flow:**\n```\nUser: 'Create a ticket'\nServer: [elicit] 'Which company is this ticket for?'\nUser: 'Acme Corp'\nServer: [elicit] 'Found 2 companies: Acme Corp Inc, Acme Corporation. Which one?'\nUser: 'Acme Corp Inc'\nServer: [elicit] 'What is the ticket title?'\nUser: 'Network issue'\nServer: [execute] create_ticket(companyId=123, title='Network issue')\n```",
+        "testStrategy": "1. Test elicitation triggers for missing required params. 2. Test disambiguation with multiple search results. 3. Test confirmation prompts for destructive operations. 4. Test multi-turn conversation context preservation. 5. Test graceful fallback when elicitation unsupported by client.",
+        "status": "done",
+        "dependencies": [],
+        "priority": "low",
+        "subtasks": [],
+        "tags": [
+          "v1.3.0",
+          "feature",
+          "ux"
+        ],
+        "updatedAt": "2026-03-09T22:36:17.555Z"
+      },
+      {
+        "id": "31",
+        "title": "Namespace All MCP Tools with 'autotask_' Prefix",
+        "description": "Refactor all 35 MCP tools to use 'autotask_' namespace prefix to prevent tool name collisions when multiple MCP servers are connected.",
+        "details": "**Problem:**\nCurrent tool names like `search_companies`, `create_ticket` are generic and will collide with other MCP servers that have similar tools (e.g., Salesforce MCP, Jira MCP).\n\n**Solution:**\nAdd `autotask_` namespace prefix to all tools:\n- `search_companies` → `autotask_search_companies`\n- `create_ticket` → `autotask_create_ticket`\n- `test_connection` → `autotask_test_connection`\n- etc.\n\n**Implementation:**\n1. Update tool definitions in `src/handlers/tool.handler.ts`\n2. Update tool call handler to use new names\n3. **Backwards Compatibility Option A (v1.4.0)**: Keep old names as aliases, emit deprecation warning\n4. **Backwards Compatibility Option B (v2.0.0)**: Remove old names, document breaking change\n5. Update all documentation and examples\n6. Update tests to use new tool names\n\n**Files to Modify:**\n- `src/handlers/tool.handler.ts` - Tool definitions (35 tools)\n- `src/mcp/server.ts` - Tool call routing\n- `tests/*.test.ts` - All test files\n- `README.md`, `QUICK_START_CLAUDE.md` - Documentation\n- `CHANGELOG.md` - Document change\n\n**Naming Convention:**\n```\nautotask_<entity>_<action>\nautotask_company_search\nautotask_company_create\nautotask_ticket_search\nautotask_ticket_create\nautotask_time_entry_create\nautotask_resource_search\nautotask_connection_test\n```\n\nAlternatively, simpler flat namespace:\n```\nautotask_search_companies\nautotask_create_company\nautotask_search_tickets\n```",
+        "testStrategy": "1. Verify all 35 tools have autotask_ prefix. 2. Test tool calls work with new names. 3. If backwards compat: test old names still work with deprecation warning. 4. Test Claude Desktop integration with namespaced tools. 5. Grep for old tool names in codebase - should be zero (except aliases). 6. Update and run full test suite.",
+        "status": "done",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": [],
+        "tags": [
+          "v2.0.0",
+          "refactor",
+          "breaking-change"
+        ],
+        "updatedAt": "2026-01-21T21:29:59.214Z"
+      },
+      {
+        "id": "32",
+        "title": "Add Contributors Section to README.md",
+        "description": "Create a Contributors section in README.md featuring a Markdown table with GitHub avatars and profile links for key contributors, starting with @Baphomet480 (CLI bin fix) and @asachs01 (maintainer).",
+        "details": "Locate the existing README.md file in the project root. Add a new top-level heading '## Contributors' in an appropriate location (after features/installation sections, before footer). Create a GitHub Flavored Markdown table with columns: Avatar | Name | Contributions. Use the format:\n\n| ![username](https://github.com/username.png?size=60) | [@username](https://github.com/username) | Contribution description |\n| --- | --- | --- |\n\nPopulate with:\n- Row 1: @Baphomet480, link to https://github.com/Baphomet480.png?size=60, 'CLI bin fix'\n- Row 2: @asachs01, link to https://github.com/asachs01.png?size=60, 'Maintainer'\n\nSet avatar size=60 for consistency. Ensure table aligns properly with | separators and --- headers. Use relative positioning if linking other docs. Commit with message 'docs: add contributors section to README.md'. Verify rendering on GitHub shows clickable avatars linking to profiles.",
+        "testStrategy": "Verify README.md contains '## Contributors' heading and table renders correctly on GitHub repository page. Confirm avatars display (60px), are clickable linking to correct profiles (@Baphomet480, @asachs01), and contribution descriptions match. Check table alignment in desktop/mobile views. Validate no broken images by inspecting avatar URLs. Ensure Markdown syntax is valid (no parsing errors) and section doesn't break existing README formatting.",
+        "status": "pending",
+        "dependencies": [
+          "20"
+        ],
+        "priority": "medium",
+        "subtasks": []
+      },
+      {
+        "id": "33",
+        "title": "Add TypeScript Interfaces for New Entities",
+        "description": "Add TypeScript interface definitions for Opportunity, Product, Service, ServiceBundle, and QuoteItem entities to src/types/autotask.ts following the existing pattern.",
+        "details": "Add the following interfaces to src/types/autotask.ts:\n\n1. AutotaskOpportunity:\n   - id?: number\n   - companyID?: number\n   - title?: string\n   - description?: string\n   - amount?: number\n   - cost?: number\n   - probability?: number\n   - projectedCloseDate?: string\n   - status?: number\n   - stage?: number\n   - ownerResourceID?: number\n   - useQuoteTotals?: boolean\n   - [key: string]: any\n\n2. AutotaskProduct:\n   - id?: number\n   - name?: string\n   - description?: string\n   - unitPrice?: number\n   - unitCost?: number\n   - isActive?: boolean\n   - isSerialized?: boolean\n   - [key: string]: any\n\n3. AutotaskService:\n   - id?: number\n   - name?: string\n   - description?: string\n   - unitPrice?: number\n   - unitCost?: number\n   - isActive?: boolean\n   - periodType?: number\n   - billingCodeID?: number\n   - [key: string]: any\n\n4. AutotaskServiceBundle:\n   - id?: number\n   - name?: string\n   - description?: string\n   - unitPrice?: number\n   - unitCost?: number\n   - isActive?: boolean\n   - periodType?: number\n   - billingCodeID?: number\n   - [key: string]: any\n\n5. AutotaskQuoteItem:\n   - id?: number\n   - quoteID?: number\n   - name?: string\n   - description?: string\n   - quantity?: number\n   - unitPrice?: number\n   - unitDiscount?: number\n   - unitCost?: number\n   - lineDiscount?: number\n   - percentageDiscount?: number\n   - isOptional?: boolean\n   - productID?: number\n   - serviceID?: number\n   - serviceBundleID?: number\n   - chargeID?: number\n   - laborID?: number\n   - expenseID?: number\n   - shippingID?: number\n   - quoteItemType?: number\n   - sortOrderID?: number\n   - totalEffectiveTax?: number\n   - averageDiscount?: number\n   - internalCurrencyUnitPrice?: number\n   - [key: string]: any\n\nFollow existing naming conventions and patterns from AutotaskQuote, AutotaskCompany, etc.",
+        "testStrategy": "Verify TypeScript compilation succeeds after adding interfaces. Import the new interfaces in a test file and ensure type checking works correctly with sample data objects.",
+        "priority": "high",
+        "dependencies": [],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-03-09T21:21:12.181Z"
+      },
+      {
+        "id": "34",
+        "title": "Implement Opportunity Service Methods",
+        "description": "Add service methods for Opportunity entity in src/services/autotask.service.ts: getOpportunity() and searchOpportunities().",
+        "details": "Implement in autotask.service.ts:\n\n1. getOpportunity(id: number): Promise<AutotaskOpportunity | null>\n   - Use client.Opportunities.get(id)\n   - Return result.data or null\n   - Log debug/error appropriately\n\n2. searchOpportunities(options): Promise<AutotaskOpportunity[]>\n   - Accept options: companyId?, title?, status?, page?, pageSize?\n   - Build filters array:\n     - If companyId: { field: 'companyID', op: 'eq', value: companyId }\n     - If title: { field: 'title', op: 'contains', value: title }\n     - If status: { field: 'status', op: 'eq', value: status }\n   - Default filter if none: { field: 'id', op: 'gte', value: 0 }\n   - Use client.Opportunities.list(queryOptions)\n   - Return (result.data as AutotaskOpportunity[]) || []\n\nPseudo-code pattern follows existing methods like searchQuotes() and getQuote().",
+        "testStrategy": "Add unit tests verifying: 1) getOpportunity method exists and returns correct type signature, 2) searchOpportunities builds correct filter arrays based on options, 3) Error handling wraps and rethrows with appropriate logging.",
+        "priority": "high",
+        "dependencies": [
+          "33"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-03-09T21:22:25.807Z"
+      },
+      {
+        "id": "35",
+        "title": "Implement Product Service Methods",
+        "description": "Add service methods for Product entity in src/services/autotask.service.ts: getProduct() and searchProducts().",
+        "details": "Implement in autotask.service.ts:\n\n1. getProduct(id: number): Promise<AutotaskProduct | null>\n   - Use client.Products.get(id)\n   - Return result.data or null\n   - Log debug/error appropriately\n\n2. searchProducts(options): Promise<AutotaskProduct[]>\n   - Accept options: name?, isActive?, page?, pageSize?\n   - Build filters array:\n     - If name: { field: 'name', op: 'contains', value: name }\n     - If isActive provided: { field: 'isActive', op: 'eq', value: isActive }\n   - Default filter if none: { field: 'id', op: 'gte', value: 0 }\n   - Use client.Products.list(queryOptions)\n   - Return (result.data as AutotaskProduct[]) || []\n\nFollow the same pattern as searchCompanies() for filter building and pagination.",
+        "testStrategy": "Add unit tests verifying: 1) getProduct method exists and returns correct type signature, 2) searchProducts builds correct filter arrays, 3) isActive filter handles boolean correctly, 4) Error handling works appropriately.",
+        "priority": "high",
+        "dependencies": [
+          "33"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-03-09T21:22:32.561Z"
+      },
+      {
+        "id": "36",
+        "title": "Implement Service and ServiceBundle Service Methods",
+        "description": "Add service methods for Service and ServiceBundle entities in src/services/autotask.service.ts.",
+        "details": "Implement in autotask.service.ts:\n\n**Service Entity:**\n1. getService(id: number): Promise<AutotaskService | null>\n2. searchServices(options): Promise<AutotaskService[]>\n   - Accept options: name?, isActive?, page?, pageSize?\n   - Filter by name (contains) and isActive (eq) when provided\n\n**ServiceBundle Entity:**\n1. getServiceBundle(id: number): Promise<AutotaskServiceBundle | null>\n2. searchServiceBundles(options): Promise<AutotaskServiceBundle[]>\n   - Accept options: name?, page?, pageSize?\n   - Filter by name (contains) when provided\n\nAll methods follow the same pattern as existing entity methods:\n- Use ensureClient() to get the autotask-node client\n- Access client.Services and client.ServiceBundles\n- Build filter arrays for list operations\n- Return typed results or empty arrays",
+        "testStrategy": "Add unit tests verifying: 1) All four methods exist with correct signatures, 2) Filter building works correctly for name and isActive options, 3) Default pagination is applied, 4) Error handling logs and rethrows appropriately.",
+        "priority": "high",
+        "dependencies": [
+          "33"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-03-09T21:22:39.216Z"
+      },
+      {
+        "id": "37",
+        "title": "Implement QuoteItem Service Methods (CRUD)",
+        "description": "Add full CRUD service methods for QuoteItem entity in src/services/autotask.service.ts: get, search, create, update, delete.",
+        "details": "Implement in autotask.service.ts:\n\n1. getQuoteItem(id: number): Promise<AutotaskQuoteItem | null>\n   - Use client.QuoteItems.get(id)\n\n2. searchQuoteItems(options): Promise<AutotaskQuoteItem[]>\n   - Accept options: quoteId (required for useful search), page?, pageSize?\n   - Filter by quoteID when provided\n\n3. createQuoteItem(quoteItem: Partial<AutotaskQuoteItem>): Promise<number>\n   - Required fields: quoteID, quantity\n   - Default unitDiscount, lineDiscount, percentageDiscount to 0\n   - Default isOptional to false\n   - Must include ONE of: productID, serviceID, serviceBundleID, chargeID, laborID, expenseID, shippingID\n   - Use client.QuoteItems.create()\n   - Return created item ID\n\n4. updateQuoteItem(id: number, updates: Partial<AutotaskQuoteItem>): Promise<void>\n   - Use client.QuoteItems.update(id, updates)\n\n5. deleteQuoteItem(id: number): Promise<void>\n   - Use client.QuoteItems.delete(id)\n\nNote: QuoteItems is a top-level entity (endpoint: /QuoteItems), not nested under Quotes.",
+        "testStrategy": "Add unit tests verifying: 1) All five CRUD methods exist with correct signatures, 2) createQuoteItem applies default values for discounts and isOptional, 3) searchQuoteItems filters by quoteId correctly, 4) deleteQuoteItem calls client.QuoteItems.delete, 5) Error handling works for all methods.",
+        "priority": "high",
+        "dependencies": [
+          "33"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-03-09T21:22:50.288Z"
+      },
+      {
+        "id": "38",
+        "title": "Add Tool Definitions for Opportunity and Product",
+        "description": "Add MCP tool definitions for Opportunity and Product entities in src/handlers/tool.definitions.ts.",
+        "details": "Add to TOOL_DEFINITIONS array in tool.definitions.ts:\n\n**Opportunity Tools:**\n- autotask_get_opportunity: Get by ID, required param: opportunityId (number)\n- autotask_search_opportunities: Search by companyId, title (partial), status; optional: page, pageSize\n\n**Product Tools:**\n- autotask_get_product: Get by ID, required param: productId (number)\n- autotask_search_products: Search by name (partial), isActive (boolean); optional: page, pageSize\n\nFollow existing patterns from tool.definitions.ts:\n- Use type: 'object' for inputSchema\n- Include clear descriptions for each property\n- Set appropriate minimum/maximum values for pagination\n- Mark required fields in the required array",
+        "testStrategy": "Verify tool definitions are syntactically correct by ensuring TypeScript compilation succeeds. Manually verify the tools appear in the exported tools array. Test that input schemas validate correctly with sample inputs.",
+        "priority": "medium",
+        "dependencies": [
+          "34",
+          "35"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-03-09T21:25:58.146Z"
+      },
+      {
+        "id": "39",
+        "title": "Add Tool Definitions for Service and ServiceBundle",
+        "description": "Add MCP tool definitions for Service and ServiceBundle entities in src/handlers/tool.definitions.ts.",
+        "details": "Add to TOOL_DEFINITIONS array in tool.definitions.ts:\n\n**Service Tools:**\n- autotask_get_service: Get by ID, required param: serviceId (number)\n- autotask_search_services: Search by name (partial), isActive (boolean); optional: page, pageSize\n  - Description should mention this is for finding service IDs for quote line items (e.g., \"IT Enhanced Workstation Support\")\n\n**ServiceBundle Tools:**\n- autotask_get_service_bundle: Get by ID, required param: serviceBundleId (number)\n- autotask_search_service_bundles: Search by name (partial); optional: page, pageSize\n\nFollow existing patterns and ensure descriptions help LLMs understand when to use each tool.",
+        "testStrategy": "Verify tool definitions are syntactically correct by ensuring TypeScript compilation succeeds. Verify the tools appear in the exported tools array and schema properties match expected types.",
+        "priority": "medium",
+        "dependencies": [
+          "36"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-03-09T21:26:00.274Z"
+      },
+      {
+        "id": "40",
+        "title": "Add Tool Definitions for QuoteItems (CRUD)",
+        "description": "Add MCP tool definitions for QuoteItem CRUD operations in src/handlers/tool.definitions.ts.",
+        "details": "Add 5 tool definitions to TOOL_DEFINITIONS array:\n\n1. autotask_get_quote_item: Get by ID, required: quoteItemId\n\n2. autotask_search_quote_items: Search/list items on a quote\n   - Optional: quoteId (recommended), page, pageSize\n\n3. autotask_create_quote_item: Create line item\n   - Required: quoteId, quantity\n   - Optional: unitPrice, name, description, productId, serviceId, serviceBundleId, chargeId, laborId, expenseId, shippingId, unitDiscount, lineDiscount, percentageDiscount, isOptional, sortOrderId\n   - Description must note: requires exactly ONE of productId, serviceId, serviceBundleId, etc.\n   - Note defaults: discounts=0, isOptional=false\n\n4. autotask_update_quote_item: Update existing item\n   - Required: quoteItemId\n   - Optional: quantity, unitPrice, name, description, discounts, isOptional, sortOrderId\n\n5. autotask_delete_quote_item: Delete item\n   - Required: quoteItemId",
+        "testStrategy": "Verify tool definitions compile correctly. Test that required fields are enforced in the schema. Verify all five CRUD operations are defined with appropriate properties and descriptions.",
+        "priority": "high",
+        "dependencies": [
+          "37"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-03-09T21:26:02.164Z"
+      },
+      {
+        "id": "41",
+        "title": "Add Tool Handlers for Opportunity, Product, Service, ServiceBundle",
+        "description": "Add tool handler mappings in src/handlers/tool.handler.ts for Opportunity, Product, Service, and ServiceBundle tools.",
+        "details": "Add to the dispatch table Map in getDispatchTable() method of AutotaskToolHandler:\n\n```typescript\n// Opportunities\n['autotask_get_opportunity', async (a) => {\n  const r = await s.getOpportunity(a.opportunityId);\n  return { result: r, message: r ? `Retrieved opportunity: ${r.title}` : 'Opportunity not found' };\n}],\n['autotask_search_opportunities', async (a) => {\n  const r = await s.searchOpportunities(a);\n  return { result: r, message: `Found ${r.length} opportunities` };\n}],\n\n// Products, Services, ServiceBundles follow same pattern\n```\n\nTotal of 8 new handler entries (2 for each entity: get + search).\nUse shorthand 's' for autotaskService and 'a' for args following existing patterns.\nTool names must exactly match those in tool.definitions.ts.",
+        "testStrategy": "Add tests verifying: 1) All 8 handlers are registered in the dispatch table, 2) Each handler calls the correct service method, 3) Response format includes both result and message, 4) Error handling propagates exceptions correctly.",
+        "priority": "medium",
+        "dependencies": [
+          "38",
+          "39"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-03-09T21:26:04.502Z"
+      },
+      {
+        "id": "42",
+        "title": "Add Tool Handlers for QuoteItems CRUD",
+        "description": "Add tool handler mappings in src/handlers/tool.handler.ts for all QuoteItem CRUD operations.",
+        "details": "Add 5 handler entries to the dispatch table for QuoteItems:\n\n1. autotask_get_quote_item: Call s.getQuoteItem(a.quoteItemId)\n2. autotask_search_quote_items: Call s.searchQuoteItems(a)\n3. autotask_create_quote_item: Transform camelCase input to API format (quoteId -> quoteID, productId -> productID, etc.), remove undefined values, call s.createQuoteItem()\n4. autotask_update_quote_item: Separate quoteItemId from updates, transform field names, call s.updateQuoteItem()\n5. autotask_delete_quote_item: Call s.deleteQuoteItem(a.quoteItemId)\n\nKey considerations:\n- Transform camelCase tool input to PascalCase API format (quoteId -> quoteID)\n- Remove undefined values before creating/updating\n- Destructure ID from updates to avoid including it in update payload",
+        "testStrategy": "Add tests verifying: 1) All 5 CRUD handlers are registered, 2) Field name transformation works correctly (quoteId -> quoteID), 3) Create handler removes undefined values, 4) Update handler separates ID from update payload, 5) Delete handler calls service correctly.",
+        "priority": "high",
+        "dependencies": [
+          "40"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-03-09T21:26:06.425Z"
+      },
+      {
+        "id": "43",
+        "title": "Add Unit Tests for New Entity Methods",
+        "description": "Add comprehensive unit tests for all new service methods following existing test patterns in tests/autotask-service.test.ts.",
+        "details": "Add test cases to tests/autotask-service.test.ts covering:\n\n1. Opportunity methods: getOpportunity, searchOpportunities exist with correct signatures\n2. Product methods: getProduct, searchProducts exist with correct signatures\n3. Service methods: getService, searchServices exist with correct signatures\n4. ServiceBundle methods: getServiceBundle, searchServiceBundles exist with correct signatures\n5. QuoteItem methods: all 5 CRUD methods exist (get, search, create, update, delete)\n\nAlso add handler mapping tests to verify all 13 new tools are registered in the dispatch table:\n- 2 opportunity tools\n- 2 product tools\n- 2 service tools\n- 2 service bundle tools\n- 5 quote item tools\n\nFollow existing test patterns using jest.mock for autotask-node client.",
+        "testStrategy": "Run `npm test` to verify all new tests pass. Ensure test coverage includes: 1) Method existence for all service methods, 2) Handler registration for all tools, 3) Tests follow existing patterns in the test file.",
+        "priority": "medium",
+        "dependencies": [
+          "34",
+          "35",
+          "36",
+          "37"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-03-09T21:26:08.836Z"
+      },
+      {
+        "id": "44",
+        "title": "Integration Testing and Documentation",
+        "description": "Perform end-to-end testing of the complete quote building workflow and update documentation.",
+        "details": "1. **Manual Integration Testing** - Test complete workflow:\n   - Search for a company: autotask_search_companies\n   - Search for an opportunity: autotask_search_opportunities\n   - Create a quote on the opportunity: autotask_create_quote\n   - Search for services by name: autotask_search_services\n   - Add quote items with quantities and prices: autotask_create_quote_item\n   - Verify skipping items with QTY 0 works\n\n2. **Test Scenarios:**\n   - Create quote with service items\n   - Create quote with product items\n   - Create quote with service bundle items\n   - Update and delete quote items\n\n3. **Run Full CI checks:**\n   ```bash\n   npm run typecheck\n   npm run lint\n   npm test\n   npm run build\n   ```\n\n4. **Verify Build Output:**\n   - All new handlers included in compiled output\n   - MCP server starts without errors\n   - Tools are listed when connecting",
+        "testStrategy": "Execute the complete quote building workflow manually through the MCP server. Verify all tools work together as described in the success criteria. Run full CI checks (typecheck, lint, test, build) and ensure no regressions.",
+        "priority": "medium",
+        "dependencies": [
+          "41",
+          "42",
+          "43"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-03-09T21:26:11.366Z"
+      }
+    ],
+    "metadata": {
+      "version": "1.0.0",
+      "lastModified": "2026-03-09T22:44:54.892Z",
+      "taskCount": 43,
+      "completedCount": 40,
+      "tags": [
+        "master"
+      ]
+    }
+  }
+}

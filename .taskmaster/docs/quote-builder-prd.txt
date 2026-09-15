@@ -1,0 +1,88 @@
+# PRD: Quote Builder - Create Quotes from Cost Sheets
+
+## Overview
+Enable the MCP server to create fully populated Autotask quotes with line items from cost sheet data. This requires exposing QuoteItems, Opportunities, Products, and Services entities that are already supported by the autotask-node library but not yet exposed through the MCP server.
+
+## Background
+Users need to build out quotes in Autotask from cost sheets (Excel spreadsheets). The workflow is:
+1. Find/identify the customer company in Autotask
+2. Find/create an opportunity (e.g., "Managed IT Services")
+3. Create a quote header attached to the opportunity
+4. Look up Autotask services/products by name (e.g., "IT Enhanced Workstation Support")
+5. Add quote items (line items) with quantities, unit prices, and service references
+6. Skip items with QTY of 0
+
+## Technical Context
+- The `autotask-node` npm package already has full CRUD support for: QuoteItems, Opportunities, Products, Services, ServiceBundles
+- QuoteItems is a top-level entity (endpoint: `/QuoteItems`), not nested under Quotes
+- Each QuoteItem requires: `quoteID`, `quantity`, `unitDiscount` (0), `lineDiscount` (0), `percentageDiscount` (0), `isOptional`
+- Each QuoteItem links to ONE item type via: `productID`, `serviceID`, `serviceBundleID`, `chargeID`, `laborID`, `expenseID`, or `shippingID`
+- The autotask-node client exposes these as: `client.QuoteItems`, `client.Opportunities`, `client.Products`, `client.Services`, `client.ServiceBundles`
+
+## Architecture Pattern
+Follow the existing pattern in the codebase:
+1. Add TypeScript interfaces to `src/types/autotask.ts`
+2. Add service methods to `src/services/autotask.service.ts`
+3. Add tool definitions to `src/handlers/tool.definitions.ts`
+4. Add tool handlers to `src/handlers/tool.handler.ts`
+5. Add tests
+
+## Requirements
+
+### 1. Opportunity Entity Support
+Add MCP tools for Autotask Opportunities:
+- `autotask_search_opportunities` - Search by company, title/name, status
+- `autotask_get_opportunity` - Get by ID
+
+Required interface fields: id, companyID, title, description, amount, cost, probability, projectedCloseDate, status, stage, ownerResourceID, useQuoteTotals
+
+### 2. Products Entity Support
+Add MCP tools for Autotask Products:
+- `autotask_search_products` - Search by name, active status
+- `autotask_get_product` - Get by ID
+
+Required interface fields: id, name, description, unitPrice, unitCost, isActive, isSerialized
+
+### 3. Services Entity Support
+Add MCP tools for Autotask Services:
+- `autotask_search_services` - Search by name, active status
+- `autotask_get_service` - Get by ID
+
+Required interface fields: id, name, description, unitPrice, unitCost, isActive, periodType, billingCodeID
+
+### 4. Service Bundles Entity Support
+Add MCP tools for Autotask Service Bundles:
+- `autotask_search_service_bundles` - Search by name
+- `autotask_get_service_bundle` - Get by ID
+
+Required interface fields: id, name, description, unitPrice, unitCost, isActive, periodType, billingCodeID
+
+### 5. QuoteItems Entity Support
+Add MCP tools for Autotask Quote Items:
+- `autotask_create_quote_item` - Create a line item on a quote
+- `autotask_search_quote_items` - Search/list items on a quote (filter by quoteID)
+- `autotask_get_quote_item` - Get by ID
+- `autotask_update_quote_item` - Update quantity, price, etc.
+- `autotask_delete_quote_item` - Remove a line item
+
+Required interface fields: id, quoteID, name, description, quantity, unitPrice, unitDiscount, unitCost, lineDiscount, percentageDiscount, isOptional, productID, serviceID, serviceBundleID, chargeID, laborID, expenseID, shippingID, quoteItemType, sortOrderID, totalEffectiveTax, averageDiscount, internalCurrencyUnitPrice
+
+Create fields (required): quoteID, quantity, unitDiscount (default 0), lineDiscount (default 0), percentageDiscount (default 0), isOptional (default false)
+Create fields (optional): name, description, unitPrice, productID, serviceID, serviceBundleID, chargeID, laborID, expenseID, shippingID, sortOrderID
+
+### 6. Tests
+Add unit tests for all new service methods and handler mappings following the existing test patterns.
+
+## Non-Goals
+- Excel file parsing (Claude handles this from screenshots/file reads)
+- Automated end-to-end quote building workflow (the individual tools enable this via prompting)
+- QuoteLocations or QuoteTemplates (not needed for MVP)
+
+## Success Criteria
+A user can prompt Claude to:
+1. Search for a company
+2. Search for an opportunity by name
+3. Create a quote on that opportunity
+4. Search for services/products by name to get IDs
+5. Add quote items with quantities and prices
+6. Skip items with QTY 0

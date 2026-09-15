@@ -1,0 +1,762 @@
+// Autotask Entity Type Definitions
+// Based on the autotask-node library types
+
+export interface AutotaskCompany {
+  id?: number;
+  companyName?: string;
+  companyType?: number;
+  phone?: string;
+  address1?: string;
+  address2?: string;
+  city?: string;
+  state?: string;
+  postalCode?: string;
+  countryID?: number;
+  isActive?: boolean;
+  ownerResourceID?: number;
+  createDate?: string;
+  lastActivityDate?: string;
+  lastTrackedModifiedDateTime?: string;
+  [key: string]: any;
+}
+
+export interface AutotaskContact {
+  id?: number;
+  companyID?: number;
+  firstName?: string;
+  lastName?: string;
+  emailAddress?: string;
+  phone?: string;
+  title?: string;
+  isActive?: number; // Note: autotask-node uses number, not boolean
+  createDate?: string;
+  lastModifiedDate?: string;
+  [key: string]: any;
+}
+
+export interface AutotaskTicket {
+  id?: number;
+  ticketNumber?: string;
+  companyID?: number;
+  contactID?: number;
+  assignedResourceID?: number;
+  assignedResourceRoleID?: number;
+  title?: string;
+  description?: string;
+  status?: number;
+  priority?: number;
+  ticketType?: number;
+  issueType?: number;
+  subIssueType?: number;
+  createDate?: string;
+  createdByContactID?: number;
+  createdByResourceID?: number;
+  dueDateTime?: string;
+  completedDate?: string;
+  lastActivityDate?: string;
+  estimatedHours?: number;
+  hoursToBeScheduled?: number;
+  queueID?: number;
+  ticketCategory?: number;
+  source?: number;
+  billingCodeID?: number;
+  serviceLevelAgreementID?: number;
+  projectID?: number;
+  ticketAdditionalContacts?: number[];
+  resolution?: string;
+  userDefinedFields?: AutotaskUserDefinedField[];
+  [key: string]: any;
+}
+
+export interface AutotaskResource {
+  id?: number;
+  firstName?: string;
+  lastName?: string;
+  userName?: string;
+  email?: string;
+  isActive?: boolean;
+  title?: string;
+  resourceType?: number;
+  userType?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskProject {
+  id?: number;
+  companyID?: number;
+  projectName?: string;
+  projectNumber?: string;
+  description?: string;
+  status?: number;
+  projectType?: number;
+  department?: number;
+  startDate?: string;
+  endDate?: string;
+  startDateTime?: string;
+  endDateTime?: string;
+  projectLeadResourceID?: number;
+  estimatedHours?: number;
+  actualHours?: number;
+  laborEstimatedRevenue?: number;
+  createDate?: string;
+  completedDate?: string;
+  contractID?: number;
+  originalEstimatedRevenue?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskTimeEntry {
+  id?: number;
+  resourceID?: number;
+  // No projectID: Autotask has no project-scoped time entry (issue #277).
+  ticketID?: number;
+  taskID?: number;
+  dateWorked?: string;
+  startDateTime?: string;
+  endDateTime?: string;
+  hoursWorked?: number;
+  hoursToBill?: number;
+  offsetHours?: number;
+  summaryNotes?: string;
+  internalNotes?: string;
+  billableToAccount?: boolean;
+  isNonBillable?: boolean;
+  createDate?: string;
+  createdByResourceID?: number;
+  lastModifiedDate?: string;
+  lastModifiedByResourceID?: number;
+  // Approval/posting status fields
+  billingApprovalDateTime?: string;  // null = not yet approved
+  billingApprovalLevelMostRecent?: number;  // references BillingItemApprovalLevels
+  billingApprovalResourceID?: number;  // who approved it
+  [key: string]: any;
+}
+
+// Additional interfaces that were missing
+export interface AutotaskConfigurationItem {
+  id?: number;
+  companyID?: number;
+  serialNumber?: string;
+  configurationItemName?: string;
+  configurationItemType?: number;
+  configurationItemCategoryID?: number;
+  isActive?: boolean;
+  warrantyExpirationDate?: string;
+  lastActivityDate?: string;
+  [key: string]: any;
+}
+
+export interface AutotaskContract {
+  id?: number;
+  companyID?: number;
+  contractName?: string;
+  contractNumber?: string;
+  startDate?: string;
+  endDate?: string;
+  status?: number;
+  contactID?: number;
+  [key: string]: any;
+}
+
+/** A service line on a Contract (Autotask entity ContractServices). */
+export interface AutotaskContractService {
+  id?: number;
+  contractID?: number;
+  serviceID?: number;
+  unitPrice?: number;
+  unitCost?: number;
+  internalCurrencyUnitPrice?: number;
+  invoiceDescription?: string;
+  internalDescription?: string;
+  quoteItemID?: number;
+  [key: string]: any;
+}
+
+/** Billed quantity for a contract service line over a date range (ContractServiceUnits). */
+export interface AutotaskContractServiceUnit {
+  id?: number;
+  contractID?: number;
+  contractServiceID?: number;
+  serviceID?: number;
+  units?: number;
+  price?: number;
+  cost?: number;
+  internalCurrencyPrice?: number;
+  startDate?: string;
+  endDate?: string;
+  approveAndPostDate?: string;
+  vendorCompanyID?: number;
+  [key: string]: any;
+}
+
+/** A service-bundle line on a Contract (ContractServiceBundles). */
+export interface AutotaskContractServiceBundle {
+  id?: number;
+  contractID?: number;
+  serviceBundleID?: number;
+  unitPrice?: number;
+  unitCost?: number;
+  internalCurrencyUnitPrice?: number;
+  invoiceDescription?: string;
+  internalDescription?: string;
+  [key: string]: any;
+}
+
+/** Billed quantity for a contract bundle line over a date range (ContractServiceBundleUnits). */
+export interface AutotaskContractServiceBundleUnit {
+  id?: number;
+  contractID?: number;
+  contractServiceBundleID?: number;
+  serviceBundleID?: number;
+  units?: number;
+  price?: number;
+  cost?: number;
+  startDate?: string;
+  endDate?: string;
+  [key: string]: any;
+}
+
+/** One recurring line, normalized to a monthly figure, as returned by getContractRecurringLines(). */
+export interface AutotaskContractRecurringLine {
+  source: 'service' | 'bundle';
+  lineID: number | undefined;
+  serviceID?: number | undefined;
+  serviceBundleID?: number | undefined;
+  name: string;
+  vendorCompanyID?: number | undefined;
+  vendorName?: string | undefined;
+  periodType?: number | undefined;
+  periodLabel?: string | undefined;
+  /** How ContractServiceUnits.price was read: extended line amount (observed default), per-unit rate, or assumed extended with no catalog match. */
+  priceBasis: 'extended' | 'per-unit' | 'assumed-extended';
+  units: number;
+  unitPrice: number;
+  unitCost: number;
+  periodTotal: number;
+  monthlyTotal: number;
+  monthlyCost: number;
+  startDate?: string | undefined;
+  endDate?: string | undefined;
+}
+
+export interface AutotaskContractRecurringLines {
+  contractID: number;
+  contractName?: string | undefined;
+  companyID?: number | undefined;
+  companyName?: string | undefined;
+  activeOn: string;
+  lines: AutotaskContractRecurringLine[];
+  monthlyTotal: number;
+  monthlyCost: number;
+  unresolvedPeriodTypes: number[];
+  /** Lines priced without a catalog cross-check; verify these against an invoice. */
+  assumedExtendedLines: number;
+}
+
+export interface AutotaskInvoice {
+  id?: number;
+  companyID?: number;
+  invoiceNumber?: string;
+  invoiceDate?: string;
+  totalAmount?: number;
+  paidAmount?: number;
+  isVoided?: boolean;
+  /**
+   * Composed by getInvoiceDetails() — populated via the
+   * Invoices GET endpoint using `includeItemsAndExpenses=true`
+   * (or a fallback billing-items query by invoiceID).
+   */
+  lineItems?: AutotaskBillingItem[];
+  [key: string]: any;
+}
+
+export interface AutotaskTask {
+  id?: number;
+  projectID?: number;
+  title?: string;
+  description?: string;
+  assignedResourceID?: number;
+  assignedResourceRoleID?: number;
+  status?: number;
+  priority?: number;
+  startDate?: string;
+  endDate?: string;
+  estimatedHours?: number;
+  actualHours?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskPhase {
+  id?: number;
+  projectID?: number;
+  title?: string;
+  description?: string;
+  startDate?: string;
+  dueDate?: string;
+  estimatedHours?: number;
+  sortOrder?: number;
+  scheduled?: boolean;
+  createDate?: string;
+  lastActivityDateTime?: string;
+  [key: string]: any;
+}
+
+export interface AutotaskTicketNote {
+  id?: number;
+  ticketID?: number;
+  noteType?: number;
+  title?: string;
+  description?: string;
+  createDate?: string;
+  createdByResourceID?: number;
+  isVisibleToClientPortal?: boolean;
+  [key: string]: any;
+}
+
+export interface AutotaskTicketChecklistItem {
+  id?: number;
+  ticketID?: number;
+  itemName?: string;
+  isCompleted?: boolean;
+  position?: number;
+  completedByResourceID?: number;
+  completedDateTime?: string;
+  [key: string]: any;
+}
+
+// Read-only entity (GET only). Each row represents a single audited change to a
+// ticket field — value-before, value-after, who, when. Surface is intentionally
+// open-ended because Autotask returns a wide, picklist-dependent field set.
+export interface AutotaskTicketHistory {
+  id?: number;
+  ticketID?: number;
+  resourceID?: number;
+  dateChanged?: string;
+  [key: string]: any;
+}
+
+export interface AutotaskProjectNote {
+  id?: number;
+  projectID?: number;
+  noteType?: number;
+  title?: string;
+  description?: string;
+  createDate?: string;
+  createdByResourceID?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskCompanyNote {
+  id?: number;
+  companyID?: number;
+  noteType?: number;
+  title?: string;
+  description?: string;
+  createDate?: string;
+  createdByResourceID?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskTicketAttachment {
+  id?: number;
+  ticketID?: number;
+  fileName?: string;
+  fileSize?: number;
+  contentType?: string;
+  data?: string; // Base64 encoded file data
+  createDate?: string;
+  createdByResourceID?: number;
+  [key: string]: any;
+}
+
+/**
+ * Request payload for creating a ticket attachment via
+ * POST /Tickets/{id}/Attachments. Autotask expects the file bytes
+ * as a base64-encoded string in `data`.
+ */
+export interface AutotaskTicketAttachmentCreateRequest {
+  title: string;
+  fullPath: string;
+  data: string; // base64-encoded file bytes
+  attachmentType?: string; // defaults to 'FILE_ATTACHMENT'
+  contentType?: string;
+  publish?: number; // 1 = All Autotask Users, 2 = Internal Users Only
+}
+
+/**
+ * Attachment on a ticket note (child of TicketNotes; the top-level
+ * TicketNoteAttachments/TicketNoteAttachment entity is the one that
+ * populates `data`). Field names verified against the live Autotask REST
+ * API's /TicketNoteAttachments/entityInformation/fields — this entity does
+ * NOT share field names with AutotaskTicketAttachment above (title/fullPath/
+ * attachDate here, not fileName/createDate).
+ */
+export interface AutotaskTicketNoteAttachment {
+  id?: number;
+  ticketID?: number;
+  ticketNoteID?: number;
+  title?: string;
+  fullPath?: string;
+  fileSize?: number;
+  contentType?: string;
+  data?: string; // Base64 encoded file data
+  attachDate?: string;
+  attachedByResourceID?: number;
+  attachedByContactID?: number;
+  attachmentType?: string;
+  publish?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskExpenseReport {
+  id?: number;
+  name?: string;
+  submittedByResourceID?: number;
+  submitDate?: string;
+  approvedDate?: string;
+  status?: number;
+  totalAmount?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskExpenseItem {
+  id?: number;
+  expenseReportID?: number;
+  expenseDate?: string;
+  description?: string;
+  amount?: number;
+  billableToAccount?: boolean;
+  [key: string]: any;
+}
+
+export interface AutotaskQuote {
+  id?: number;
+  companyID?: number;
+  contactID?: number;
+  quoteNumber?: string;
+  quoteDate?: string;
+  title?: string;
+  description?: string;
+  totalAmount?: number;
+  status?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskOpportunity {
+  id?: number;
+  companyID?: number;
+  title?: string;
+  description?: string;
+  amount?: number;
+  cost?: number;
+  probability?: number;
+  projectedCloseDate?: string;
+  status?: number;
+  stage?: number;
+  ownerResourceID?: number;
+  useQuoteTotals?: boolean;
+  createDate?: string;
+  lastActivityDate?: string;
+  [key: string]: any;
+}
+
+export interface AutotaskProduct {
+  id?: number;
+  name?: string;
+  description?: string;
+  unitPrice?: number;
+  unitCost?: number;
+  isActive?: boolean;
+  isSerialized?: boolean;
+  [key: string]: any;
+}
+
+export interface AutotaskServiceEntity {
+  id?: number;
+  name?: string;
+  description?: string;
+  unitPrice?: number;
+  unitCost?: number;
+  isActive?: boolean;
+  periodType?: number;
+  billingCodeID?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskServiceBundle {
+  id?: number;
+  name?: string;
+  description?: string;
+  unitPrice?: number;
+  unitCost?: number;
+  isActive?: boolean;
+  periodType?: number;
+  billingCodeID?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskQuoteItem {
+  id?: number;
+  quoteID?: number;
+  name?: string;
+  description?: string;
+  quantity?: number;
+  unitPrice?: number;
+  unitDiscount?: number;
+  unitCost?: number;
+  lineDiscount?: number;
+  percentageDiscount?: number;
+  isOptional?: boolean;
+  productID?: number;
+  serviceID?: number;
+  serviceBundleID?: number;
+  chargeID?: number;
+  laborID?: number;
+  expenseID?: number;
+  shippingID?: number;
+  quoteItemType?: number;
+  sortOrderID?: number;
+  totalEffectiveTax?: number;
+  averageDiscount?: number;
+  internalCurrencyUnitPrice?: number;
+  [key: string]: any;
+}
+
+/**
+ * TicketCharge - represents a charge (material, cost, or expense) associated with a ticket.
+ * Charges can be used to bill clients for parts, travel, or other non-labor costs.
+ */
+export interface AutotaskTicketCharge {
+  id?: number;
+  ticketID?: number;
+  productID?: number;
+  name?: string;
+  description?: string;
+  chargeType?: number;
+  unitQuantity?: number;
+  unitPrice?: number;
+  unitCost?: number;
+  billingCodeID?: number;
+  billableToAccount?: boolean;
+  datePurchased?: string;
+  createDate?: string;
+  creatorResourceID?: number;
+  status?: number;
+  contractServiceID?: number;
+  contractServiceBundleID?: number;
+  internalCurrencyUnitPrice?: number;
+  internalCurrencyUnitCost?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskServiceCall {
+  id?: number;
+  description?: string;
+  status?: number;
+  startDateTime?: string;
+  endDateTime?: string;
+  duration?: number;
+  companyID?: number;
+  companyLocationID?: number;
+  complete?: boolean;
+  createDate?: string;
+  lastModifiedDateTime?: string;
+  creatorResourceID?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskServiceCallTicket {
+  id?: number;
+  serviceCallID?: number;
+  ticketID?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskServiceCallTicketResource {
+  id?: number;
+  serviceCallTicketID?: number;
+  resourceID?: number;
+  roleID?: number;
+  [key: string]: any;
+}
+
+
+export interface AutotaskBillingCode {
+  id?: number;
+  name?: string;
+  description?: string;
+  isActive?: boolean;
+  hourlyRate?: number;
+  [key: string]: any;
+}
+
+export interface AutotaskDepartment {
+  id?: number;
+  name?: string;
+  description?: string;
+  isActive?: boolean;
+  [key: string]: any;
+}
+
+/**
+ * BillingItem - represents an approved and posted billable item in Autotask.
+ * These are items that have gone through the "Approve and Post" workflow.
+ */
+export interface AutotaskBillingItem {
+  readonly id?: number;
+  itemName?: string;
+  description?: string;
+  billingItemType?: number;
+  companyID?: number;
+  contractID?: number;
+  ticketID?: number;
+  taskID?: number;
+  projectID?: number;
+  timeEntryID?: number;
+  expenseItemID?: number;
+  milestoneID?: number;
+  itemApproverID?: number;
+  postedDate?: string;
+  itemDate?: string;
+  quantity?: number;
+  rate?: number;
+  extendedPrice?: number;
+  totalAmount?: number;
+  internalCurrencyExtendedPrice?: number;
+  internalCurrencyRate?: number;
+  internalCurrencyTotalAmount?: number;
+  invoiceID?: number;
+  accountManagerWhenApprovedID?: number;
+  businessDivisionSubdivisionID?: number;
+  nonBillable?: number;
+  taxDollars?: number;
+  webServiceDate?: string;
+  [key: string]: any;
+}
+
+/**
+ * BillingItemApprovalLevel - describes a multi-level approval record for an Autotask time entry.
+ * This entity enables developers to implement tiered approval workflows through the REST API.
+ */
+export interface AutotaskBillingItemApprovalLevel {
+  readonly id?: number;
+  timeEntryID?: number;
+  approvalLevel?: number;
+  approvalResourceID?: number;
+  approvalDateTime?: string;
+  [key: string]: any;
+}
+
+export interface AutotaskUserDefinedField {
+  name: string;
+  value: string;
+}
+
+// API Response wrapper types
+export interface AutotaskApiResponse<T> {
+  items: T[];
+  pageDetails?: {
+    count: number;
+    requestCount: number;
+    prevPageUrl?: string;
+    nextPageUrl?: string;
+  };
+}
+
+export interface AutotaskApiSingleResponse<T> {
+  item: T;
+}
+
+// Filter and query types that match autotask-node structure
+export interface AutotaskQueryOptions {
+  filter?: Record<string, any>;
+  sort?: string;
+  page?: number;
+  pageSize?: number;
+  // Common search filters (Issue #8 fix)
+  searchTerm?: string;
+  companyID?: number;
+  isActive?: boolean | number;
+}
+
+// Extended query options for more advanced queries
+export interface AutotaskQueryOptionsExtended extends AutotaskQueryOptions {
+  includeFields?: string[];
+  excludeFields?: string[];
+  expand?: string[];
+  submitterId?: number;
+  companyId?: number;
+  companyID?: number;
+  contactId?: number;
+  contactID?: number;
+  opportunityId?: number;
+  searchTerm?: string;
+  status?: number;
+  priority?: number;
+  queueID?: number;
+  assignedResourceID?: number;
+  unassigned?: boolean;
+  // Date filters for ticket searches
+  createdAfter?: string;
+  createdBefore?: string;
+  lastActivityAfter?: string;
+  // Expense item filters
+  expenseReportId?: number;
+  startDate?: string;
+  endDate?: string;
+}
+
+// Note: Ticket status values are instance-specific picklist values.
+// Use autotask_list_ticket_statuses to discover valid values at runtime.
+
+export enum TicketPriority {
+  Low = 1,
+  Medium = 2,
+  High = 3,
+  Critical = 4,
+  Urgent = 5
+}
+
+export enum CompanyType {
+  Customer = 1,
+  Lead = 2,
+  Prospect = 3,
+  DeadLead = 4,
+  Vendor = 5,
+  Partner = 6
+} 
+/**
+ * One row of Autotask's ResourceRoles entity: a resource's assignment to a
+ * billing role. Every ticket/task time entry must carry a roleID that is one
+ * of the entry's resource's ACTIVE assignments, and a ticket assigned to a
+ * resource must name one of that resource's roles too.
+ */
+export interface AutotaskResourceRole {
+  id: number;
+  resourceID: number;
+  roleID: number;
+  departmentID?: number;
+  queueID?: number;
+  hourlyRate?: number;
+  isActive?: boolean;
+}
+
+/** Autotask's Roles entity: the billing role a ResourceRoles row points at. */
+export interface AutotaskRole {
+  id: number;
+  name: string;
+  description?: string;
+  isActive?: boolean;
+  isSystemRole?: boolean;
+  hourlyRate?: number;
+}
+
+/** What autotask_search_resource_roles returns: an assignment joined to its role's name. */
+export interface AutotaskResourceRoleSummary {
+  roleID: number;
+  roleName: string;
+  resourceID: number;
+  isActive: boolean;
+  departmentID?: number | undefined;
+  hourlyRate?: number | undefined;
+}

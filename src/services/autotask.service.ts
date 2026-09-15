@@ -1,0 +1,3153 @@
+// Autotask Service Layer
+// Talks to the Autotask REST API via AutotaskHttpClient (native fetch).
+//
+// This file used to wrap the autotask-node SDK. The SDK gets multiple URL
+// shapes wrong (PATCH /{Entity}/{id} → 405, several GETs → 404, list()
+// silently drops filters), so we now bypass it entirely. Zero new runtime
+// deps — only Node 18+ built-in `fetch` via AutotaskHttpClient.
+
+import { resolveAutotaskApiUrl } from '../utils/config';
+import { AutotaskHttpClient, QueryFilter } from './autotask-http';
+import {
+  AutotaskContractService,
+  AutotaskContractServiceUnit,
+  AutotaskContractServiceBundle,
+  AutotaskContractServiceBundleUnit,
+  AutotaskContractRecurringLine,
+  AutotaskContractRecurringLines,
+  AutotaskCompany,
+  AutotaskContact,
+  AutotaskTicket,
+  AutotaskTimeEntry,
+  AutotaskProject,
+  AutotaskResource,
+  AutotaskConfigurationItem,
+  AutotaskContract,
+  AutotaskInvoice,
+  AutotaskTask,
+  AutotaskQueryOptions,
+  AutotaskTicketNote,
+  AutotaskProjectNote,
+  AutotaskCompanyNote,
+  AutotaskTicketAttachment,
+  AutotaskTicketNoteAttachment,
+  AutotaskTicketChecklistItem,
+  AutotaskTicketAttachmentCreateRequest,
+  AutotaskExpenseReport,
+  AutotaskExpenseItem,
+  AutotaskQuote,
+  AutotaskQuoteItem,
+  AutotaskOpportunity,
+  AutotaskProduct,
+  AutotaskServiceEntity,
+  AutotaskServiceBundle,
+  AutotaskBillingCode,
+  AutotaskDepartment,
+  AutotaskQueryOptionsExtended,
+  AutotaskBillingItem,
+  AutotaskBillingItemApprovalLevel,
+  AutotaskTicketCharge,
+  AutotaskTicketHistory,
+  AutotaskServiceCall,
+  AutotaskServiceCallTicket,
+  AutotaskServiceCallTicketResource,
+  AutotaskPhase,
+  AutotaskResourceRole,
+  AutotaskRole,
+  AutotaskResourceRoleSummary
+} from '../types/autotask';
+import { McpServerConfig } from '../types/mcp';
+import { Logger } from '../utils/logger';
+import { FieldInfo, PicklistValue } from './picklist.cache';
+
+/**
+ * Default "match all" filter required by Autotask for unconstrained queries.
+ */
+export const MATCH_ALL: QueryFilter[] = [{ op: 'gte', field: 'id', value: 0 }];
+
+/**
+ * Push an `eq` filter only when `value` is not `undefined`. Replaces the
+ * `if (options.X !== undefined) filters.push({ op: 'eq', field: 'X', value: options.X })`
+ * pattern that was previously duplicated across every search method.
+ */
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+function round4(n: number): number {
+  return Math.round(n * 10000) / 10000;
+}
+
+function uniqueNumbers(values: Array<number | undefined | null>): number[] {
+  return Array.from(new Set(values.filter((v): v is number => typeof v === 'number' && !Number.isNaN(v))));
+}
+
+/** First value that is a non-empty string (`??` does not skip ""). */
+function firstNonEmpty(...values: Array<string | undefined | null>): string | undefined {
+  for (const v of values) if (typeof v === 'string' && v.trim() !== '') return v;
+  return undefined;
+}
+
+/** First value that is a positive number (`??` does not skip 0). */
+function firstPositive(...values: Array<number | undefined | null>): number | undefined {
+  for (const v of values) if (typeof v === 'number' && v > 0) return v;
+  return undefined;
+}
+
+/**
+ * Decide whether a ContractServiceUnits.price is the extended line amount or a
+ * per-unit rate by comparing it with the catalog rate. Extended is the observed
+ * default on live tenants; per-unit is accepted only when price itself matches
+ * the catalog and price/units does not.
+ */
+function classifyPriceBasis(price: number, units: number, catalogRate: number | undefined): 'extended' | 'per-unit' | 'assumed-extended' {
+  if (catalogRate == null || catalogRate <= 0 || units <= 0) return 'assumed-extended';
+  const close = (a: number, b: number) => Math.abs(a - b) <= Math.max(0.011, b * 0.005);
+  if (close(price / units, catalogRate)) return 'extended';
+  if (units > 1 && close(price, catalogRate)) return 'per-unit';
+  return 'assumed-extended';
+}
+
+function pushEq(filters: QueryFilter[], field: string, value: unknown): void {
+  if (value !== undefined) {
+    filters.push({ op: 'eq', field, value });
+  }
+}
+
+/**
+ * Merge the `options.filter` escape hatch (array of QueryFilter or a flat
+ * `field → value` object) into the in-progress filters list. Previously
+ * inlined as a 7-line block in every search method.
+ */
+function mergeFilterEscapeHatch(
+  filters: QueryFilter[],
+  raw: QueryFilter[] | Record<string, unknown> | undefined,
+): void {
+  if (!raw) return;
+  if (Array.isArray(raw)) {
+    if (raw.length > 0) filters.push(...raw);
+    return;
+  }
+  for (const [field, value] of Object.entries(raw)) {
+    filters.push({ op: 'eq', field, value });
+  }
+}
+
+export class AutotaskService {
+  private http: AutotaskHttpClient | null = null;
+  private logger: Logger;
+  private config: McpServerConfig;
+  private initializationPromise: Promise<void> | null = null;
+
+  constructor(config: McpServerConfig, logger: Logger) {
+    this.config = config;
+    this.logger = logger;
+  }
+
+  /**
+   * Stable identity of the tenant these credentials belong to (lowercased
+   * API username), used to key per-tenant caches that outlive a single
+   * request. Null when credentials aren't configured.
+   */
+  getTenantKey(): string | null {
+    const username = this.config.autotask.username;
+    return username ? username.toLowerCase() : null;
+  }
+
+  /**
+   * Initialize the Autotask HTTP client with credentials.
+   *
+   * We only validate credentials here — the zone-resolved URL is fetched
+   * lazily inside AutotaskHttpClient on the first actual request, so the
+   * server starts cleanly even if the zone info endpoint is unreachable.
+   */
+  async initialize(): Promise<void> {
+    try {
+      const { username, secret, integrationCode, apiUrl, impersonationResourceId } = this.config.autotask;
+
+      if (!username || !secret || !integrationCode) {
+        throw new Error('Missing required Autotask credentials: username, secret, and integrationCode are required');
+      }
+
+      this.logger.info('Initializing Autotask HTTP client...');
+      if (impersonationResourceId !== undefined) {
+        this.logger.info(`Impersonating Autotask resource ${impersonationResourceId}`);
+      }
+      this.http = new AutotaskHttpClient(
+        username,
+        secret,
+        integrationCode,
+        apiUrl,
+        this.logger,
+        impersonationResourceId
+      );
+      this.logger.info('Autotask HTTP client initialized successfully');
+    } catch (error) {
+      this.logger.error('Failed to initialize Autotask HTTP client:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Ensure HTTP client is initialized (with lazy initialization).
+   */
+  private async ensureClient(): Promise<AutotaskHttpClient> {
+    if (!this.http) {
+      await this.ensureInitialized();
+    }
+    return this.http!;
+  }
+
+  private async ensureInitialized(): Promise<void> {
+    if (this.initializationPromise) {
+      await this.initializationPromise;
+      return;
+    }
+    if (this.http) return;
+    this.initializationPromise = this.initialize();
+    await this.initializationPromise;
+  }
+
+  // =====================================================
+  // Companies (Autotask entity: Companies)
+  // =====================================================
+
+  async getCompany(id: number): Promise<AutotaskCompany | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting company with ID: ${id}`);
+      return await http.get<AutotaskCompany>('Companies', id);
+    } catch (error) {
+      this.logger.error(`Failed to get company ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchCompanies(options: AutotaskQueryOptions = {}): Promise<AutotaskCompany[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching companies with options:', options);
+
+      const filters: QueryFilter[] = [];
+      if (options.searchTerm) {
+        filters.push({ op: 'contains', field: 'companyName', value: options.searchTerm });
+      }
+      if (options.isActive !== undefined) {
+        filters.push({ op: 'eq', field: 'isActive', value: options.isActive });
+      }
+
+      const page = Math.max(1, options.page || 1);
+      const pageSize = Math.min(options.pageSize || 25, 200);
+      // Autotask's REST API paginates by cursor (nextPageUrl), not offset, and
+      // http.query walks cursors transparently until it hits maxRecords. To
+      // honor a caller's `page` argument we have to fetch up to (page*pageSize)
+      // records and slice. Wasteful at high page numbers but the only way to
+      // give offset-style semantics on top of a cursor API.
+      const targetEnd = page * pageSize;
+      const fetched = await http.query<AutotaskCompany>(
+        'Companies',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: targetEnd }
+      );
+      const start = (page - 1) * pageSize;
+      const companies = fetched.slice(start, targetEnd);
+
+      this.logger.info(
+        `Retrieved ${companies.length} companies (page ${page}, pageSize ${pageSize}, fetched ${fetched.length} to slice)`
+      );
+      return companies;
+    } catch (error) {
+      this.logger.error('Failed to search companies:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Bulk-load every company in the tenant, intended for cache pre-warm paths
+   * like `MappingService.refreshCompanyCache`. Distinct from `searchCompanies`
+   * because: (a) we don't want a small default pageSize, (b) we don't want any
+   * filtering, (c) we don't want offset-style slicing. `http.query` walks
+   * `pageDetails.nextPageUrl` transparently until either all records are
+   * fetched or `maxRecords` is hit.
+   *
+   * The hard cap of 20_000 is a tenant-size safety net — anything beyond that
+   * suggests the cache pre-warm is the wrong tool. Logs a warning if hit.
+   */
+  async listAllCompanies(maxRecords: number = 20_000): Promise<AutotaskCompany[]> {
+    const http = await this.ensureClient();
+    const companies = await http.query<AutotaskCompany>('Companies', MATCH_ALL, { maxRecords });
+    if (companies.length === maxRecords) {
+      this.logger.warn(
+        `listAllCompanies: hit maxRecords cap (${maxRecords}). Some companies may be missing from downstream consumers (cache pre-warm, etc.).`
+      );
+    }
+    this.logger.info(`Retrieved ${companies.length} companies via listAllCompanies`);
+    return companies;
+  }
+
+  async createCompany(company: Partial<AutotaskCompany>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating company:', company);
+      const id = await http.create('Companies', company);
+      this.logger.info(`Company created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create company:', error);
+      throw error;
+    }
+  }
+
+  async updateCompany(id: number, updates: Partial<AutotaskCompany>): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Updating company ${id}:`, updates);
+      await http.update('Companies', id, updates as Record<string, any>);
+      this.logger.info(`Company ${id} updated successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to update company ${id}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Contacts
+  // =====================================================
+
+  async getContact(id: number): Promise<AutotaskContact | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting contact with ID: ${id}`);
+      return await http.get<AutotaskContact>('Contacts', id);
+    } catch (error) {
+      this.logger.error(`Failed to get contact ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchContacts(options: AutotaskQueryOptions = {}): Promise<AutotaskContact[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching contacts with options:', options);
+
+      const filters: QueryFilter[] = [];
+      if (options.searchTerm) {
+        filters.push({
+          op: 'or',
+          items: [
+            { op: 'contains', field: 'firstName', value: options.searchTerm },
+            { op: 'contains', field: 'lastName', value: options.searchTerm },
+            { op: 'contains', field: 'emailAddress', value: options.searchTerm }
+          ]
+        });
+      }
+      if (options.companyID !== undefined) {
+        filters.push({ op: 'eq', field: 'companyID', value: options.companyID });
+      }
+      if (options.isActive !== undefined) {
+        filters.push({ op: 'eq', field: 'isActive', value: options.isActive });
+      }
+
+      const pageSize = Math.min(options.pageSize || 25, 200);
+      const contacts = await http.query<AutotaskContact>(
+        'Contacts',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: pageSize }
+      );
+
+      this.logger.info(`Retrieved ${contacts.length} contacts (pageSize ${pageSize})`);
+      return contacts;
+    } catch (error) {
+      this.logger.error('Failed to search contacts:', error);
+      throw error;
+    }
+  }
+
+  async createContact(contact: Partial<AutotaskContact>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating contact:', contact);
+      const id = await http.create('Contacts', contact);
+      this.logger.info(`Contact created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create contact:', error);
+      throw error;
+    }
+  }
+
+  async updateContact(id: number, updates: Partial<AutotaskContact>): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Updating contact ${id}:`, updates);
+      try {
+        await http.update('Contacts', id, updates as Record<string, any>);
+      } catch (err) {
+        // Some zone hosts register NEITHER route update() tries: the
+        // collection-level PATCH /Contacts returns an HTML 404 (the Zone DE1
+        // behaviour from issue #133) AND the PUT /Contacts/{id} fallback is
+        // rejected with 405 (#197), so every contact update fails with no
+        // workaround. Contacts are a child entity of Companies, so retry
+        // through the documented child route
+        // PATCH /Companies/{companyID}/Contacts — resolving the parent from
+        // the update payload when supplied, otherwise from the existing
+        // record. The fallback is gated on 404/405 so genuine validation
+        // errors (400/422) surface unchanged, and ordered last so zones where
+        // update() works (including DE1's PUT fallback) keep their behaviour.
+        const status = (err as { status?: number })?.status;
+        if (status !== 404 && status !== 405) throw err;
+        let companyID = (updates as Record<string, any>).companyID as number | null | undefined;
+        if (companyID === undefined || companyID === null) {
+          companyID = ((await this.getContact(id)) as Record<string, any> | null)?.companyID;
+        }
+        if (companyID === undefined || companyID === null) {
+          throw new Error(
+            `Cannot update contact ${id}: unable to resolve parent companyID for the ` +
+            `Companies/{companyID}/Contacts child route (does the contact still exist?)`,
+            { cause: err }
+          );
+        }
+        this.logger.debug(
+          `Contact ${id}: update() failed with HTTP ${status} — retrying via Companies/${companyID}/Contacts child route`
+        );
+        await http.childUpdate('Companies', companyID, 'Contacts', id, updates as Record<string, any>);
+      }
+      this.logger.info(`Contact ${id} updated successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to update contact ${id}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Tickets
+  // =====================================================
+
+  async getTicket(id: number, fullDetails: boolean = false): Promise<AutotaskTicket | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting ticket with ID: ${id}, fullDetails: ${fullDetails}`);
+      const ticket = await http.get<AutotaskTicket>('Tickets', id);
+      if (!ticket) return null;
+      return fullDetails ? ticket : this.optimizeTicketData(ticket);
+    } catch (error) {
+      this.logger.error(`Failed to get ticket ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchTickets(options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskTicket[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching tickets with options:', options);
+
+      const filters: QueryFilter[] = [];
+
+      if (options.searchTerm) {
+        filters.push({ op: 'beginsWith', field: 'ticketNumber', value: options.searchTerm });
+      }
+
+      if (options.status !== undefined) {
+        filters.push({ op: 'eq', field: 'status', value: options.status });
+      } else {
+        filters.push({ op: 'noteq', field: 'status', value: 5 }); // 5 = Complete (Autotask REST uses 'noteq', not 'ne')
+      }
+
+      if (options.queueID !== undefined) {
+        filters.push({ op: 'eq', field: 'queueID', value: options.queueID });
+      }
+
+      if (options.priority !== undefined) {
+        filters.push({ op: 'eq', field: 'priority', value: options.priority });
+      }
+
+      if (options.unassigned === true) {
+        filters.push({ op: 'eq', field: 'assignedResourceID', value: null });
+      } else if (options.assignedResourceID !== undefined) {
+        filters.push({ op: 'eq', field: 'assignedResourceID', value: options.assignedResourceID });
+      }
+
+      const companyId = options.companyID ?? options.companyId;
+      if (companyId !== undefined) {
+        filters.push({ op: 'eq', field: 'companyID', value: companyId });
+      }
+
+      const contactId = options.contactID ?? options.contactId;
+      if (contactId !== undefined) {
+        filters.push({ op: 'eq', field: 'contactID', value: contactId });
+      }
+
+      if (options.createdAfter) {
+        filters.push({ op: 'gte', field: 'createDate', value: options.createdAfter });
+      }
+      if (options.createdBefore) {
+        filters.push({ op: 'lte', field: 'createDate', value: options.createdBefore });
+      }
+      if (options.lastActivityAfter) {
+        filters.push({ op: 'gte', field: 'lastActivityDate', value: options.lastActivityAfter });
+      }
+
+      const pageSize = Math.min(options.pageSize || 25, 500);
+      const tickets = await http.query<AutotaskTicket>('Tickets', filters, { maxRecords: pageSize });
+      const optimized = tickets.map(t => this.optimizeTicketDataAggressive(t));
+
+      this.logger.info(`Retrieved ${optimized.length} tickets (pageSize ${pageSize})`);
+      return optimized;
+    } catch (error) {
+      this.logger.error('Failed to search tickets:', error);
+      throw error;
+    }
+  }
+
+  private optimizeTicketDataAggressive(ticket: AutotaskTicket): AutotaskTicket {
+    const optimized: AutotaskTicket = {};
+    if (ticket.id !== undefined) optimized.id = ticket.id;
+    if (ticket.ticketNumber !== undefined) optimized.ticketNumber = ticket.ticketNumber;
+    if (ticket.title !== undefined) optimized.title = ticket.title;
+    if (ticket.description !== undefined && ticket.description !== null) {
+      optimized.description = ticket.description.length > 200
+        ? ticket.description.substring(0, 200) + '... [truncated - use get_ticket_details for full text]'
+        : ticket.description;
+    }
+    if (ticket.status !== undefined) optimized.status = ticket.status;
+    if (ticket.priority !== undefined) optimized.priority = ticket.priority;
+    if (ticket.companyID !== undefined) optimized.companyID = ticket.companyID;
+    if (ticket.contactID !== undefined) optimized.contactID = ticket.contactID;
+    if (ticket.assignedResourceID !== undefined) optimized.assignedResourceID = ticket.assignedResourceID;
+    if (ticket.createDate !== undefined) optimized.createDate = ticket.createDate;
+    if (ticket.lastActivityDate !== undefined) optimized.lastActivityDate = ticket.lastActivityDate;
+    if (ticket.dueDateTime !== undefined) optimized.dueDateTime = ticket.dueDateTime;
+    if (ticket.completedDate !== undefined) optimized.completedDate = ticket.completedDate;
+    if (ticket.estimatedHours !== undefined) optimized.estimatedHours = ticket.estimatedHours;
+    if (ticket.ticketType !== undefined) optimized.ticketType = ticket.ticketType;
+    if (ticket.source !== undefined) optimized.source = ticket.source;
+    if (ticket.issueType !== undefined) optimized.issueType = ticket.issueType;
+    if (ticket.subIssueType !== undefined) optimized.subIssueType = ticket.subIssueType;
+    if (ticket.resolution !== undefined && ticket.resolution !== null) {
+      optimized.resolution = ticket.resolution.length > 100
+        ? ticket.resolution.substring(0, 100) + '... [truncated - use get_ticket_details for full text]'
+        : ticket.resolution;
+    }
+    return optimized;
+  }
+
+  private optimizeTicketData(ticket: AutotaskTicket): AutotaskTicket {
+    const maxDescriptionLength = 500;
+    const maxNotesLength = 300;
+    return {
+      ...ticket,
+      description: ticket.description && ticket.description.length > maxDescriptionLength
+        ? ticket.description.substring(0, maxDescriptionLength) + '... [truncated]'
+        : ticket.description,
+      resolution: ticket.resolution && ticket.resolution.length > maxNotesLength
+        ? ticket.resolution.substring(0, maxNotesLength) + '... [truncated]'
+        : ticket.resolution,
+      userDefinedFields: [],
+      ...(ticket.purchaseOrderNumber && {
+        purchaseOrderNumber: ticket.purchaseOrderNumber.length > 50
+          ? ticket.purchaseOrderNumber.substring(0, 50) + '...'
+          : ticket.purchaseOrderNumber
+      })
+    };
+  }
+
+  async createTicket(ticket: Partial<AutotaskTicket>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating ticket:', ticket);
+      const id = await http.create('Tickets', ticket);
+      this.logger.info(`Ticket created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create ticket:', error);
+      throw error;
+    }
+  }
+
+  async updateTicket(id: number, updates: Partial<AutotaskTicket>): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Updating ticket ${id}:`, updates);
+      await http.update('Tickets', id, updates as Record<string, any>);
+      this.logger.info(`Ticket ${id} updated successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to update ticket ${id}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Ticket Charges (child of Tickets for create/delete)
+  // =====================================================
+
+  async getTicketCharge(id: number): Promise<AutotaskTicketCharge | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting ticket charge with ID: ${id}`);
+      return await http.get<AutotaskTicketCharge>('TicketCharges', id);
+    } catch (error) {
+      this.logger.error(`Failed to get ticket charge ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchTicketCharges(options: AutotaskQueryOptionsExtended & { ticketId?: number } = {}): Promise<AutotaskTicketCharge[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching ticket charges with options:', options);
+      const filters: QueryFilter[] = [];
+      if (options.ticketId) {
+        filters.push({ op: 'eq', field: 'ticketID', value: options.ticketId });
+      }
+      const pageSize = options.pageSize || (filters.length > 0 ? 25 : 10);
+      return await http.query<AutotaskTicketCharge>(
+        'TicketCharges',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: pageSize }
+      );
+    } catch (error) {
+      this.logger.error('Failed to search ticket charges:', error);
+      throw error;
+    }
+  }
+
+  async createTicketCharge(charge: Partial<AutotaskTicketCharge>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      if (!charge.ticketID) {
+        throw new Error('ticketID is required to create a ticket charge');
+      }
+      this.logger.debug('Creating ticket charge:', charge);
+      // TicketCharges is a child entity — create via parent URL.
+      const id = await http.childCreate('Tickets', charge.ticketID, 'Charges', charge);
+      this.logger.info(`Ticket charge created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create ticket charge:', error);
+      throw error;
+    }
+  }
+
+  async updateTicketCharge(id: number, updates: Partial<AutotaskTicketCharge>): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Updating ticket charge ${id}:`, updates);
+      await http.update('TicketCharges', id, updates as Record<string, any>);
+      this.logger.info(`Ticket charge ${id} updated successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to update ticket charge ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async deleteTicketCharge(ticketId: number, chargeId: number): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Deleting ticket charge ${chargeId} from ticket ${ticketId}`);
+      await http.childDelete('Tickets', ticketId, 'Charges', chargeId);
+      this.logger.info(`Ticket charge ${chargeId} deleted successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to delete ticket charge ${chargeId}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Ticket History (read-only audit trail of field changes)
+  // =====================================================
+
+  async getTicketHistory(id: number): Promise<AutotaskTicketHistory | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting ticket history entry with ID: ${id}`);
+      return await http.get<AutotaskTicketHistory>('TicketHistory', id);
+    } catch (error) {
+      this.logger.error(`Failed to get ticket history entry ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchTicketHistory(options: AutotaskQueryOptionsExtended & { ticketId?: number } = {}): Promise<AutotaskTicketHistory[]> {
+    // Autotask requires a ticketID filter for TicketHistory queries — surface
+    // a friendly error instead of letting the API reject with a generic 400.
+    // Guard before ensureClient() so callers fail fast without a network round-trip.
+    if (!options.ticketId) {
+      throw new Error('ticketId is required to search ticket history');
+    }
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching ticket history with options:', options);
+      const filters: QueryFilter[] = [
+        { op: 'eq', field: 'ticketID', value: options.ticketId },
+      ];
+      return await http.query<AutotaskTicketHistory>(
+        'TicketHistory',
+        filters,
+        { maxRecords: Math.min(options.pageSize || 50, 500) }
+      );
+    } catch (error) {
+      this.logger.error('Failed to search ticket history:', error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Time Entries
+  // =====================================================
+
+  async createTimeEntry(timeEntry: Partial<AutotaskTimeEntry>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating time entry:', timeEntry);
+
+      // Do not reintroduce child routes here: POST /Tickets/{id}/TimeEntries and
+      // POST /Tasks/{id}/TimeEntries do not exist and 404 (issue #277). The
+      // parent travels in the payload as ticketID or taskID.
+      const id = await http.create('TimeEntries', timeEntry);
+      this.logger.info(`Time entry created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create time entry:', error);
+      throw error;
+    }
+  }
+
+  async getTimeEntries(options: AutotaskQueryOptions = {}): Promise<AutotaskTimeEntry[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Getting time entries with options:', options);
+      const pageSize = Math.min(options.pageSize || 25, 500);
+      const filter: QueryFilter[] =
+        Array.isArray(options.filter) && options.filter.length > 0
+          ? (options.filter as QueryFilter[])
+          : MATCH_ALL;
+      return await http.query<AutotaskTimeEntry>('TimeEntries', filter, { maxRecords: pageSize });
+    } catch (error) {
+      this.logger.error('Failed to get time entries:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Resolve a resource by full/partial name via POST /Resources/query.
+   * Returns the first match, or null.
+   */
+  async resolveResourceByName(name: string): Promise<{ id: number; firstName: string; lastName: string } | null> {
+    const http = await this.ensureClient();
+    try {
+      // Try an exact concat match first: firstName + ' ' + lastName.
+      const parts = name.trim().split(/\s+/);
+      const first = parts[0];
+      const last = parts.slice(1).join(' ') || undefined;
+
+      const filters: QueryFilter[] = [{ op: 'eq', field: 'isActive', value: true }];
+      if (first && last) {
+        filters.push({
+          op: 'and',
+          items: [
+            { op: 'contains', field: 'firstName', value: first },
+            { op: 'contains', field: 'lastName', value: last }
+          ]
+        });
+      } else {
+        filters.push({
+          op: 'or',
+          items: [
+            { op: 'contains', field: 'firstName', value: first },
+            { op: 'contains', field: 'lastName', value: first },
+            { op: 'contains', field: 'email', value: first }
+          ]
+        });
+      }
+
+      const results = await http.query<{ id: number; firstName: string; lastName: string }>(
+        'Resources',
+        filters,
+        { maxRecords: 5 }
+      );
+      return results[0] || null;
+    } catch (error) {
+      this.logger.error(`Failed to resolve resource "${name}":`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Return the list of internal (non-customer-facing) billing code names.
+   * Queries BillingCodes with useType = 3 (Regular (Internal) Time).
+   */
+  async getInternalBillingCodeNames(): Promise<string[]> {
+    const http = await this.ensureClient();
+    try {
+      const codes = await http.query<{ name: string }>(
+        'BillingCodes',
+        [
+          { op: 'eq', field: 'useType', value: 3 },
+          { op: 'eq', field: 'isActive', value: true }
+        ],
+        { maxRecords: 500 }
+      );
+      return codes.map(bc => bc.name).filter((n): n is string => typeof n === 'string');
+    } catch (error) {
+      this.logger.error('Failed to get internal billing codes:', error);
+      throw error;
+    }
+  }
+  
+  /**
+   * Resolves an internal billing code by name.
+   * Queries BillingCodes with useType = 3 (Regular (Internal) Time)
+   */
+  async resolveInternalBillingCodeByName(name: string): Promise<{ id: number; name: string } | null> {
+    const http = await this.ensureClient();
+    try {
+      const results = await http.query<{ id: number; name: string }>(
+        'BillingCodes',
+        [
+          { op: 'eq', field: 'useType', value: 3 },
+          { op: 'eq', field: 'isActive', value: true },
+          { op: 'eq', field: 'name', value: name }
+        ],
+        { maxRecords: 5 }
+      );
+      return results[0] || null;
+    } catch (error) {
+      this.logger.error(`Failed to resolve billing code "${name}":`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Projects
+  // =====================================================
+
+  async getProject(id: number): Promise<AutotaskProject | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting project with ID: ${id}`);
+      return await http.get<AutotaskProject>('Projects', id);
+    } catch (error) {
+      this.logger.error(`Failed to get project ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchProjects(options: AutotaskQueryOptions = {}): Promise<AutotaskProject[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching projects with options:', options);
+      const filters: QueryFilter[] = [];
+      const o = options as any;
+
+      pushEq(filters, 'companyID', o.companyID);
+      pushEq(filters, 'status', o.status);
+      pushEq(filters, 'projectLeadResourceID', o.projectLeadResourceID);
+      if (o.searchTerm) {
+        filters.push({ op: 'contains', field: 'projectName', value: o.searchTerm });
+      }
+      mergeFilterEscapeHatch(filters, options.filter);
+
+      const pageSize = Math.min(options.pageSize || 25, 100);
+      const projects = await http.query<AutotaskProject>(
+        'Projects',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: pageSize }
+      );
+      const optimized = projects.map(p => this.optimizeProjectData(p));
+      this.logger.info(`Retrieved ${optimized.length} projects`);
+      return optimized;
+    } catch (error) {
+      this.logger.error('Failed to search projects:', error);
+      throw error;
+    }
+  }
+
+  private optimizeProjectData(project: AutotaskProject): AutotaskProject {
+    const maxDescriptionLength = 500;
+    const optimizedDescription = project.description
+      ? (project.description.length > maxDescriptionLength
+          ? project.description.substring(0, maxDescriptionLength) + '... [truncated]'
+          : project.description)
+      : '';
+    return { ...project, description: optimizedDescription, userDefinedFields: [] };
+  }
+
+  async createProject(project: Partial<AutotaskProject>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating project:', project);
+      const id = await http.create('Projects', project);
+      this.logger.info(`Project created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create project:', error);
+      throw error;
+    }
+  }
+
+  async updateProject(id: number, updates: Partial<AutotaskProject>): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Updating project ${id}:`, updates);
+      await http.update('Projects', id, updates as Record<string, any>);
+      this.logger.info(`Project ${id} updated successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to update project ${id}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Resources
+  // =====================================================
+
+  async getResource(id: number): Promise<AutotaskResource | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting resource with ID: ${id}`);
+      return await http.get<AutotaskResource>('Resources', id);
+    } catch (error) {
+      this.logger.error(`Failed to get resource ${id}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * The billing roles a resource holds (Autotask ResourceRoles joined to
+   * Roles for the names). Active assignments only unless asked otherwise.
+   *
+   * Two queries, both filtered: never an enumeration of every role in the
+   * tenant.
+   */
+  async searchResourceRoles(resourceId: number, includeInactive = false): Promise<AutotaskResourceRoleSummary[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Searching roles for resource ${resourceId}`);
+      const filters: QueryFilter[] = [{ op: 'eq', field: 'resourceID', value: resourceId }];
+      if (!includeInactive) {
+        filters.push({ op: 'eq', field: 'isActive', value: true });
+      }
+      const assignments = await http.query<AutotaskResourceRole>('ResourceRoles', filters, { maxRecords: 100 });
+      if (assignments.length === 0) {
+        return [];
+      }
+      const roleIds = [...new Set(assignments.map(a => a.roleID))];
+      const roles = await http.query<AutotaskRole>(
+        'Roles',
+        [{ op: 'in', field: 'id', value: roleIds }],
+        { maxRecords: Math.max(roleIds.length, 1) }
+      );
+      const byId = new Map(roles.map(r => [r.id, r]));
+      // One row per ROLE, not per assignment: Autotask holds a ResourceRoles
+      // row per (resource, role, department/queue), so a person with one role
+      // across five queues comes back five times — and would otherwise look
+      // like five roles to choose between. The first assignment's department
+      // and rate are kept as representative.
+      const summaries: AutotaskResourceRoleSummary[] = [];
+      const seen = new Set<number>();
+      for (const a of assignments) {
+        if (seen.has(a.roleID)) {
+          continue;
+        }
+        seen.add(a.roleID);
+        summaries.push({
+          roleID: a.roleID,
+          roleName: byId.get(a.roleID)?.name ?? `Role ${a.roleID}`,
+          resourceID: a.resourceID,
+          isActive: a.isActive !== false,
+          departmentID: a.departmentID,
+          hourlyRate: a.hourlyRate,
+        });
+      }
+      this.logger.info(`Retrieved ${summaries.length} roles for resource ${resourceId}`);
+      return summaries;
+    } catch (error) {
+      this.logger.error(`Failed to search roles for resource ${resourceId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * The one roleID to use for a resource: their only active role, or the
+   * active role whose name matches `roleName`. Anything ambiguous is refused
+   * with the resource's roles spelled out (name and id), so the caller can
+   * choose by name next time instead of guessing an id — Autotask answers a
+   * wrong id with "Role does not exist or is invalid", which says nothing
+   * about what would have been right.
+   */
+  async resolveRoleForResource(resourceId: number, roleName?: string): Promise<number> {
+    const roles = await this.searchResourceRoles(resourceId);
+    const list = roles.map(r => `${r.roleName} (roleID ${r.roleID})`).join(', ');
+
+    if (roles.length === 0) {
+      throw new Error(`Resource ${resourceId} has no active roles in Autotask, so no roleID can be chosen for them. An Autotask administrator must assign the resource a role first.`);
+    }
+
+    const wanted = roleName?.trim().toLowerCase();
+    if (wanted) {
+      const exact = roles.filter(r => r.roleName.toLowerCase() === wanted);
+      const matches = exact.length > 0 ? exact : roles.filter(r => r.roleName.toLowerCase().includes(wanted));
+      if (matches.length === 1) {
+        return matches[0].roleID;
+      }
+      throw new Error(matches.length === 0
+        ? `Resource ${resourceId} has no active role matching "${roleName}". Their roles: ${list}.`
+        : `"${roleName}" matches more than one of resource ${resourceId}'s roles: ${matches.map(r => `${r.roleName} (roleID ${r.roleID})`).join(', ')}. Give the full role name.`);
+    }
+
+    if (roles.length === 1) {
+      return roles[0].roleID;
+    }
+
+    throw new Error(`Resource ${resourceId} holds ${roles.length} active roles and Autotask needs exactly one: ${list}. Pass roleName (or roleID) to choose.`);
+  }
+
+  async searchResources(options: AutotaskQueryOptions = {}): Promise<AutotaskResource[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching resources with options:', options);
+      const filters: QueryFilter[] = [];
+      if (options.searchTerm) {
+        filters.push({
+          op: 'or',
+          items: [
+            { op: 'contains', field: 'email', value: options.searchTerm },
+            { op: 'contains', field: 'firstName', value: options.searchTerm },
+            { op: 'contains', field: 'lastName', value: options.searchTerm }
+          ]
+        });
+      }
+      const pageSize = Math.min(options.pageSize || 25, 500);
+      const resources = await http.query<AutotaskResource>(
+        'Resources',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: pageSize }
+      );
+      this.logger.info(`Retrieved ${resources.length} resources`);
+      return resources;
+    } catch (error) {
+      this.logger.error('Failed to search resources:', error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Configuration Items
+  // =====================================================
+
+  async getConfigurationItem(id: number): Promise<AutotaskConfigurationItem | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting configuration item with ID: ${id}`);
+      return await http.get<AutotaskConfigurationItem>('ConfigurationItems', id);
+    } catch (error) {
+      this.logger.error(`Failed to get configuration item ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchConfigurationItems(options: AutotaskQueryOptions = {}): Promise<AutotaskConfigurationItem[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching configuration items with options:', options);
+      // Schema-shaped filter args were previously dropped — issue #105.
+      const filters: QueryFilter[] = [];
+      const o = options as any;
+
+      pushEq(filters, 'companyID', o.companyID);
+      pushEq(filters, 'isActive', o.isActive);
+      pushEq(filters, 'productID', o.productID);
+      pushEq(filters, 'configurationItemType', o.configurationItemType);
+      pushEq(filters, 'configurationItemCategoryID', o.configurationItemCategoryID);
+      if (o.searchTerm) {
+        filters.push({ op: 'contains', field: 'referenceTitle', value: o.searchTerm });
+      }
+      mergeFilterEscapeHatch(filters, options.filter);
+
+      const pageSize = Math.min(options.pageSize || 25, 500);
+      return await http.query<AutotaskConfigurationItem>(
+        'ConfigurationItems',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: pageSize }
+      );
+    } catch (error) {
+      this.logger.error('Failed to search configuration items:', error);
+      throw error;
+    }
+  }
+
+  async createConfigurationItem(configItem: Partial<AutotaskConfigurationItem>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating configuration item:', configItem);
+      const id = await http.create('ConfigurationItems', configItem);
+      this.logger.info(`Configuration item created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create configuration item:', error);
+      throw error;
+    }
+  }
+
+  async updateConfigurationItem(id: number, updates: Partial<AutotaskConfigurationItem>): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Updating configuration item ${id}:`, updates);
+      await http.update('ConfigurationItems', id, updates as Record<string, any>);
+      this.logger.info(`Configuration item ${id} updated successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to update configuration item ${id}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Contracts (read-only)
+  // =====================================================
+
+  async getContract(id: number): Promise<AutotaskContract | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting contract with ID: ${id}`);
+      return await http.get<AutotaskContract>('Contracts', id);
+    } catch (error) {
+      this.logger.error(`Failed to get contract ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchContracts(options: AutotaskQueryOptions = {}): Promise<AutotaskContract[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching contracts with options:', options);
+      // Schema-shaped filter args were previously dropped — issue #105.
+      const filters: QueryFilter[] = [];
+      const o = options as any;
+
+      pushEq(filters, 'companyID', o.companyID);
+      pushEq(filters, 'status', o.status);
+      pushEq(filters, 'contractType', o.contractType);
+      if (o.searchTerm) {
+        filters.push({ op: 'contains', field: 'contractName', value: o.searchTerm });
+      }
+      if (o.endDateFrom) {
+        filters.push({ op: 'gte', field: 'endDate', value: o.endDateFrom });
+      }
+      if (o.endDateTo) {
+        filters.push({ op: 'lte', field: 'endDate', value: o.endDateTo });
+      }
+      mergeFilterEscapeHatch(filters, options.filter);
+
+      const pageSize = Math.min(options.pageSize || 25, 500);
+      return await http.query<AutotaskContract>(
+        'Contracts',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: pageSize }
+      );
+    } catch (error) {
+      this.logger.error('Failed to search contracts:', error);
+      throw error;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Contract service lines and billed units (read-only)
+  // ---------------------------------------------------------------------------
+
+  /** Service lines on a contract (ContractServices). */
+  async searchContractServices(options: { contractID: number; pageSize?: number }): Promise<AutotaskContractService[]> {
+    const http = await this.ensureClient();
+    try {
+      const filters: QueryFilter[] = [{ op: 'eq', field: 'contractID', value: options.contractID }];
+      const pageSize = Math.min(options.pageSize || 100, 500);
+      return await http.query<AutotaskContractService>('ContractServices', filters, { maxRecords: pageSize });
+    } catch (error) {
+      this.logger.error(`Failed to search contract services for contract ${options.contractID}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Billed unit rows for a contract (ContractServiceUnits). With `activeOn`
+   * (ISO date, default today) only rows whose date range covers that day are
+   * returned, which is the quantity currently being invoiced.
+   */
+  async searchContractServiceUnits(options: { contractID: number; activeOn?: string; pageSize?: number }): Promise<AutotaskContractServiceUnit[]> {
+    const http = await this.ensureClient();
+    try {
+      const filters = this.unitDateFilters(options.contractID, options.activeOn);
+      const pageSize = Math.min(options.pageSize || 200, 500);
+      return await http.query<AutotaskContractServiceUnit>('ContractServiceUnits', filters, { maxRecords: pageSize });
+    } catch (error) {
+      this.logger.error(`Failed to search contract service units for contract ${options.contractID}:`, error);
+      throw error;
+    }
+  }
+
+  /** Service-bundle lines on a contract (ContractServiceBundles). */
+  async searchContractServiceBundles(options: { contractID: number; pageSize?: number }): Promise<AutotaskContractServiceBundle[]> {
+    const http = await this.ensureClient();
+    try {
+      const filters: QueryFilter[] = [{ op: 'eq', field: 'contractID', value: options.contractID }];
+      const pageSize = Math.min(options.pageSize || 100, 500);
+      return await http.query<AutotaskContractServiceBundle>('ContractServiceBundles', filters, { maxRecords: pageSize });
+    } catch (error) {
+      this.logger.error(`Failed to search contract service bundles for contract ${options.contractID}:`, error);
+      throw error;
+    }
+  }
+
+  /** Billed unit rows for bundle lines (ContractServiceBundleUnits), same date semantics as service units. */
+  async searchContractServiceBundleUnits(options: { contractID: number; activeOn?: string; pageSize?: number }): Promise<AutotaskContractServiceBundleUnit[]> {
+    const http = await this.ensureClient();
+    try {
+      const filters = this.unitDateFilters(options.contractID, options.activeOn);
+      const pageSize = Math.min(options.pageSize || 200, 500);
+      return await http.query<AutotaskContractServiceBundleUnit>('ContractServiceBundleUnits', filters, { maxRecords: pageSize });
+    } catch (error) {
+      this.logger.error(`Failed to search contract service bundle units for contract ${options.contractID}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * One call per contract for recurring-revenue reporting: every service and
+   * bundle line with units active on `activeOn`, joined to the catalog for
+   * names, vendors and billing period, and normalized to a monthly total.
+   *
+   * Price basis. On live tenants `ContractServiceUnits.price` (and `.cost`) is
+   * the EXTENDED line amount for the period, not a per-unit rate: AIC's
+   * Business Premium row is units 11, price 254.10, catalog unitPrice 23.10.
+   * Each line is therefore checked against the catalog: if price/units matches
+   * the catalog rate the row is treated as extended (the expected case); if
+   * price itself matches the catalog rate the row is treated as per-unit; with
+   * no catalog match the row defaults to extended and says so in `priceBasis`.
+   *
+   * Catalog and vendor lookups run sequentially and are cached on the service
+   * instance; a rate-limit or auth error surfaces instead of degrading into
+   * rows with blank names. Lines whose period type cannot be resolved keep the
+   * period total as the monthly figure and appear in `unresolvedPeriodTypes`.
+   */
+  async getContractRecurringLines(options: { contractID: number; activeOn?: string }): Promise<AutotaskContractRecurringLines> {
+    const activeOn = options.activeOn || new Date().toISOString().slice(0, 10);
+    const contract = await this.getContract(options.contractID);
+    const serviceLines = await this.searchContractServices({ contractID: options.contractID, pageSize: 500 });
+    const serviceUnits = await this.searchContractServiceUnits({ contractID: options.contractID, activeOn, pageSize: 500 });
+    const bundleLines = await this.searchContractServiceBundles({ contractID: options.contractID, pageSize: 500 });
+    const bundleUnits = await this.searchContractServiceBundleUnits({ contractID: options.contractID, activeOn, pageSize: 500 });
+
+    const periodLabels = await this.servicePeriodLabels();
+    const unresolved = new Set<number>();
+    const lines: AutotaskContractRecurringLine[] = [];
+
+    const serviceById = new Map<number, AutotaskContractService>();
+    for (const l of serviceLines) if (l.id != null) serviceById.set(l.id, l);
+    const bundleById = new Map<number, AutotaskContractServiceBundle>();
+    for (const l of bundleLines) if (l.id != null) bundleById.set(l.id, l);
+
+    // Sequential, cached lookups. No swallowed errors: a 429 or 401 here must be seen.
+    const serviceIDs = uniqueNumbers(serviceUnits.map(u => u.serviceID ?? serviceById.get(u.contractServiceID as number)?.serviceID));
+    const bundleIDs = uniqueNumbers(bundleUnits.map(u => u.serviceBundleID ?? bundleById.get(u.contractServiceBundleID as number)?.serviceBundleID));
+    for (const id of serviceIDs) {
+      if (!this.serviceCatalogCache.has(id)) this.serviceCatalogCache.set(id, await this.getService(id));
+    }
+    for (const id of bundleIDs) {
+      if (!this.bundleCatalogCache.has(id)) this.bundleCatalogCache.set(id, await this.getServiceBundle(id));
+    }
+    const vendorIDs = uniqueNumbers(serviceIDs.map(id => this.serviceCatalogCache.get(id)?.vendorCompanyID));
+    for (const id of vendorIDs) {
+      if (!this.vendorNameCache.has(id)) this.vendorNameCache.set(id, (await this.getCompany(id))?.companyName ?? undefined);
+    }
+
+    const monthlyFactor = (periodType?: number): number | null => {
+      if (periodType == null) return null;
+      const label = (periodLabels.get(periodType) || '').toLowerCase();
+      if (/semi/.test(label)) return 1 / 6;
+      if (/quarter/.test(label)) return 1 / 3;
+      if (/annual|year/.test(label)) return 1 / 12;
+      if (/month/.test(label)) return 1;
+      if (/week/.test(label)) return 52 / 12;
+      if (/one[- ]?time/.test(label)) return 0;
+      return null;
+    };
+
+    const build = (
+      source: 'service' | 'bundle',
+      u: AutotaskContractServiceUnit | AutotaskContractServiceBundleUnit,
+      line: { id?: number; unitPrice?: number; unitCost?: number; invoiceDescription?: string; internalDescription?: string } | undefined,
+      cat: { name?: string; unitPrice?: number; unitCost?: number; periodType?: number; vendorCompanyID?: number } | undefined,
+      ids: { serviceID?: number | undefined; serviceBundleID?: number | undefined; lineID: number | undefined },
+    ): AutotaskContractRecurringLine => {
+      const units = Number(u.units ?? 0);
+      const catalogRate = firstPositive(line?.unitPrice, cat?.unitPrice);
+      const basis = classifyPriceBasis(Number(u.price ?? 0), units, catalogRate);
+      const periodTotal = basis === 'per-unit' ? round2(units * Number(u.price ?? 0)) : round2(Number(u.price ?? 0));
+      const unitPrice = units > 0 ? round4(periodTotal / units) : Number(u.price ?? 0);
+      const rawCost = Number(u.cost ?? 0);
+      const catalogCost = firstPositive(line?.unitCost, cat?.unitCost);
+      // Cost follows the same basis as price when present; otherwise fall back to the catalog rate.
+      const unitCost = rawCost > 0
+        ? (basis === 'per-unit' ? rawCost : (units > 0 ? round4(rawCost / units) : rawCost))
+        : (catalogCost ?? 0);
+      const factor = monthlyFactor(cat?.periodType);
+      if (factor === null && cat?.periodType != null) unresolved.add(cat.periodType);
+      const fallbackName = source === 'service' ? `Service ${ids.serviceID}` : `Bundle ${ids.serviceBundleID}`;
+      return {
+        source,
+        lineID: ids.lineID,
+        ...(ids.serviceID != null ? { serviceID: ids.serviceID } : {}),
+        ...(ids.serviceBundleID != null ? { serviceBundleID: ids.serviceBundleID } : {}),
+        name: firstNonEmpty(cat?.name, line?.invoiceDescription, line?.internalDescription) ?? fallbackName,
+        vendorCompanyID: cat?.vendorCompanyID,
+        vendorName: cat?.vendorCompanyID != null ? this.vendorNameCache.get(cat.vendorCompanyID) : undefined,
+        periodType: cat?.periodType,
+        periodLabel: cat?.periodType != null ? periodLabels.get(cat.periodType) : undefined,
+        priceBasis: basis,
+        units,
+        unitPrice,
+        unitCost,
+        periodTotal,
+        monthlyTotal: round2(periodTotal * (factor ?? 1)),
+        monthlyCost: round2(units * unitCost * (factor ?? 1)),
+        startDate: u.startDate,
+        endDate: u.endDate,
+      };
+    };
+
+    for (const u of serviceUnits) {
+      const line = serviceById.get(u.contractServiceID as number);
+      const serviceID = u.serviceID ?? line?.serviceID;
+      const cat = serviceID != null ? this.serviceCatalogCache.get(serviceID) ?? undefined : undefined;
+      lines.push(build('service', u, line, cat, { serviceID, lineID: line?.id ?? u.contractServiceID }));
+    }
+    for (const u of bundleUnits) {
+      const line = bundleById.get(u.contractServiceBundleID as number);
+      const serviceBundleID = u.serviceBundleID ?? line?.serviceBundleID;
+      const cat = serviceBundleID != null ? this.bundleCatalogCache.get(serviceBundleID) ?? undefined : undefined;
+      lines.push(build('bundle', u, line, cat, { serviceBundleID, lineID: line?.id ?? u.contractServiceBundleID }));
+    }
+
+    lines.sort((a, b) => b.monthlyTotal - a.monthlyTotal || a.name.localeCompare(b.name));
+    let companyName: string | undefined;
+    if (contract?.companyID != null) {
+      companyName = (await this.getCompany(contract.companyID))?.companyName ?? undefined;
+    }
+    return {
+      contractID: options.contractID,
+      contractName: contract?.contractName,
+      companyID: contract?.companyID,
+      companyName,
+      activeOn,
+      lines,
+      monthlyTotal: round2(lines.reduce((a, l) => a + l.monthlyTotal, 0)),
+      monthlyCost: round2(lines.reduce((a, l) => a + l.monthlyCost, 0)),
+      unresolvedPeriodTypes: Array.from(unresolved).sort((a, b) => a - b),
+      assumedExtendedLines: lines.filter(l => l.priceBasis === 'assumed-extended').length,
+    };
+  }
+
+  private serviceCatalogCache = new Map<number, any>();
+  private bundleCatalogCache = new Map<number, any>();
+  private vendorNameCache = new Map<number, string | undefined>();
+
+  private unitDateFilters(contractID: number, activeOn?: string): QueryFilter[] {
+    const day = activeOn || new Date().toISOString().slice(0, 10);
+    return [
+      { op: 'eq', field: 'contractID', value: contractID },
+      { op: 'lte', field: 'startDate', value: `${day}T23:59:59` },
+      { op: 'gte', field: 'endDate', value: `${day}T00:00:00` },
+    ];
+  }
+
+  private periodLabelCache: Map<number, string> | null = null;
+  /**
+   * Services.periodType labels, cached for the process.
+   *
+   * Only a successful, non-empty load is cached, and a failure propagates. An
+   * earlier version cached the map outside the try and swallowed the error: a
+   * single failed getFieldInfo (a 429 is realistic here) left an empty map
+   * cached for the process lifetime, monthlyFactor then returned null for
+   * every period type, `factor ?? 1` billed yearly lines as monthly, and the
+   * contract total overstated by up to 12x. Without the picklist there is no
+   * correct monthly figure to return, so this fails loudly rather than
+   * quietly producing wrong money.
+   */
+  private async servicePeriodLabels(): Promise<Map<number, string>> {
+    if (this.periodLabelCache) return this.periodLabelCache;
+    const map = new Map<number, string>();
+    const fields = await this.getFieldInfo('Services');
+    const pt = fields.find(f => f.name === 'periodType');
+    for (const pv of pt?.picklistValues || []) {
+      const v = Number((pv as any).value);
+      if (!Number.isNaN(v)) map.set(v, String((pv as any).label ?? ''));
+    }
+    if (map.size === 0) {
+      throw new Error('Services.periodType picklist came back empty; cannot normalize contract lines to a monthly figure');
+    }
+    this.periodLabelCache = map;
+    return map;
+  }
+
+  /**
+   * Expiring/expired contracts report (issue #237): contracts whose endDate
+   * falls within the next `daysAhead` days (default 60). With
+   * `includeExpired`, already-lapsed contracts are included too. Scope to one
+   * company via `companyID`, or the whole org by omitting it.
+   */
+  async listExpiringContracts(options: {
+    daysAhead?: number;
+    companyID?: number;
+    includeExpired?: boolean;
+    status?: number;
+    pageSize?: number;
+  } = {}): Promise<AutotaskContract[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Listing expiring contracts with options:', options);
+      const daysAhead = options.daysAhead ?? 60;
+      const dayMs = 24 * 60 * 60 * 1000;
+      const isoDay = (d: Date) => d.toISOString().slice(0, 10);
+      const today = new Date();
+
+      const filters: QueryFilter[] = [
+        { op: 'lte', field: 'endDate', value: isoDay(new Date(today.getTime() + daysAhead * dayMs)) },
+      ];
+      if (!options.includeExpired) {
+        filters.push({ op: 'gte', field: 'endDate', value: isoDay(today) });
+      }
+      pushEq(filters, 'companyID', options.companyID);
+      pushEq(filters, 'status', options.status);
+
+      const pageSize = Math.min(options.pageSize || 100, 500);
+      return await http.query<AutotaskContract>('Contracts', filters, { maxRecords: pageSize });
+    } catch (error) {
+      this.logger.error('Failed to list expiring contracts:', error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Contracts (write) and ContractServices CRUD
+  // =====================================================
+
+  async createContract(contract: Partial<AutotaskContract>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating contract:', contract);
+      const id = await http.create('Contracts', contract);
+      this.logger.info(`Contract created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create contract:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Bulk contract-shell creation (issue #237). The Autotask REST API has no
+   * batch endpoint for Contracts, so shells are POSTed one at a time —
+   * sequentially, to stay under the per-integration API thresholds. A failed
+   * shell doesn't abort the batch; each item reports its own outcome so
+   * callers can retry just the failures.
+   */
+  async createContracts(contracts: Partial<AutotaskContract>[]): Promise<Array<{
+    index: number;
+    contractName?: string | undefined;
+    success: boolean;
+    id?: number | undefined;
+    error?: string | undefined;
+  }>> {
+    const results: Array<{
+      index: number;
+      contractName?: string | undefined;
+      success: boolean;
+      id?: number | undefined;
+      error?: string | undefined;
+    }> = [];
+    for (const [index, contract] of contracts.entries()) {
+      try {
+        const id = await this.createContract(contract);
+        results.push({ index, contractName: contract.contractName, success: true, id });
+      } catch (error) {
+        results.push({
+          index,
+          contractName: contract.contractName,
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    return results;
+  }
+
+  async updateContract(id: number, updates: Partial<AutotaskContract>): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Updating contract ${id}:`, updates);
+      await http.update('Contracts', id, updates as Record<string, any>);
+      this.logger.info(`Contract ${id} updated successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to update contract ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async createContractService(cs: Record<string, any>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating contract service:', cs);
+      const id = await http.create('ContractServices', cs);
+      this.logger.info(`ContractService created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create contract service:', error);
+      throw error;
+    }
+  }
+
+  async updateContractService(id: number, updates: Record<string, any>): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Updating contract service ${id}:`, updates);
+      await http.update('ContractServices', id, updates);
+      this.logger.info(`ContractService ${id} updated successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to update contract service ${id}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Invoices
+  // =====================================================
+
+  async getInvoice(id: number): Promise<AutotaskInvoice | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting invoice with ID: ${id}`);
+      return await http.get<AutotaskInvoice>('Invoices', id);
+    } catch (error) {
+      this.logger.error(`Failed to get invoice ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchInvoices(options: AutotaskQueryOptions = {}): Promise<AutotaskInvoice[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching invoices with options:', options);
+      // Schema-shaped filter args were previously dropped — issue #105.
+      const filters: QueryFilter[] = [];
+      const o = options as any;
+
+      pushEq(filters, 'companyID', o.companyID);
+      pushEq(filters, 'invoiceNumber', o.invoiceNumber);
+      pushEq(filters, 'isVoided', o.isVoided);
+      mergeFilterEscapeHatch(filters, options.filter);
+
+      const pageSize = Math.min(options.pageSize || 25, 500);
+      return await http.query<AutotaskInvoice>(
+        'Invoices',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: pageSize }
+      );
+    } catch (error) {
+      this.logger.error('Failed to search invoices:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get an invoice with its line items composed from BillingItems.
+   *
+   * The Autotask REST API supports `includeItemsAndExpenses=true` on the GET
+   * /Invoices/{id} endpoint, but since our shared HTTP helper doesn't pass
+   * query params, we use the simpler approach: fetch the invoice, then fetch
+   * BillingItems filtered by invoiceID. The result shape is identical.
+   */
+  async getInvoiceDetails(id: number): Promise<AutotaskInvoice | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting invoice details with ID: ${id}`);
+      const invoice = await http.get<AutotaskInvoice>('Invoices', id);
+      if (!invoice) return null;
+
+      let lineItems: AutotaskBillingItem[] = [];
+      try {
+        lineItems = await http.query<AutotaskBillingItem>(
+          'BillingItems',
+          [{ op: 'eq', field: 'invoiceID', value: id }],
+          { maxRecords: 500 }
+        );
+      } catch (biErr) {
+        this.logger.warn(
+          `Failed to fetch line items for invoice ${id}: ${(biErr as Error).message}`
+        );
+      }
+
+      return { ...invoice, lineItems };
+    } catch (error) {
+      this.logger.error(`Failed to get invoice details ${id}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Tasks
+  // =====================================================
+
+  async getTask(id: number): Promise<AutotaskTask | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting task with ID: ${id}`);
+      return await http.get<AutotaskTask>('Tasks', id);
+    } catch (error) {
+      this.logger.error(`Failed to get task ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchTasks(options: AutotaskQueryOptions = {}): Promise<AutotaskTask[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching tasks with options:', options);
+      // Schema-shaped filter args were previously dropped — issues #104, #105.
+      const filters: QueryFilter[] = [];
+      const o = options as any;
+
+      pushEq(filters, 'projectID', o.projectID);
+      pushEq(filters, 'status', o.status);
+      pushEq(filters, 'assignedResourceID', o.assignedResourceID);
+      if (o.searchTerm) {
+        filters.push({ op: 'contains', field: 'title', value: o.searchTerm });
+      }
+      mergeFilterEscapeHatch(filters, options.filter);
+
+      // Honor `page` via fetch-and-slice over http.query's cursor pagination —
+      // same pattern as searchCompanies (#101). Autotask's REST API has no
+      // native offset, so we fetch up to page*pageSize and slice.
+      const page = Math.max(1, o.page || 1);
+      const pageSize = Math.min(options.pageSize || 25, 100);
+      const targetEnd = page * pageSize;
+      const fetched = await http.query<AutotaskTask>(
+        'Tasks',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: targetEnd }
+      );
+      const start = (page - 1) * pageSize;
+      const tasks = fetched.slice(start, targetEnd);
+      const optimized = tasks.map(t => this.optimizeTaskData(t));
+      this.logger.info(
+        `Retrieved ${optimized.length} tasks (page ${page}, pageSize ${pageSize}, fetched ${fetched.length} to slice)`
+      );
+      return optimized;
+    } catch (error) {
+      this.logger.error('Failed to search tasks:', error);
+      throw error;
+    }
+  }
+
+  private optimizeTaskData(task: AutotaskTask): AutotaskTask {
+    const maxDescriptionLength = 400;
+    const optimizedDescription = task.description
+      ? (task.description.length > maxDescriptionLength
+          ? task.description.substring(0, maxDescriptionLength) + '... [truncated]'
+          : task.description)
+      : '';
+    return { ...task, description: optimizedDescription, userDefinedFields: [] };
+  }
+
+  async createTask(task: Partial<AutotaskTask>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating task:', task);
+      if (!task.projectID) {
+        throw new Error('projectID is required to create a task');
+      }
+      // Tasks are created via POST /Projects/{projectID}/Tasks
+      const id = await http.childCreate('Projects', task.projectID, 'Tasks', task);
+      this.logger.info(`Task created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create task:', error);
+      throw error;
+    }
+  }
+
+  async updateTask(id: number, updates: Partial<AutotaskTask>): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Updating task ${id}:`, updates);
+      if (!updates.projectID) {
+        throw new Error('projectID is required to update a task');
+      }
+      // Update via PATCH on the collection endpoint: /Projects/{projectID}/Tasks
+      // with the task ID in the body.
+      await http.childUpdate('Projects', updates.projectID, 'Tasks', id, updates as Record<string, any>);
+      this.logger.info(`Task ${id} updated successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to update task ${id}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Phases
+  // =====================================================
+
+  async createPhase(phase: Partial<AutotaskPhase>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating phase:', phase);
+      if (!phase.projectID) {
+        throw new Error('projectID is required to create a phase');
+      }
+      const id = await http.childCreate('Projects', phase.projectID, 'Phases', phase);
+      this.logger.info(`Phase created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create phase:', error);
+      throw error;
+    }
+  }
+
+  async searchPhases(projectID: number, options: AutotaskQueryOptions = {}): Promise<AutotaskPhase[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Searching phases for project ${projectID}:`, options);
+      const phases = await http.childQuery<AutotaskPhase>(
+        'Projects',
+        projectID,
+        'Phases',
+        MATCH_ALL,
+        { maxRecords: options.pageSize || 25 }
+      );
+      this.logger.info(`Retrieved ${phases.length} phases for project ${projectID}`);
+      return phases;
+    } catch (error) {
+      this.logger.error(`Failed to search phases for project ${projectID}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Utility
+  // =====================================================
+
+  async testConnection(): Promise<boolean> {
+    try {
+      const http = await this.ensureClient();
+      // Cheap probe: query Companies with a trivial filter.
+      await http.query<AutotaskCompany>('Companies', MATCH_ALL, { maxRecords: 1 });
+      this.logger.info('Connection test successful');
+      return true;
+    } catch (error) {
+      this.logger.error('Connection test failed:', error);
+      return false;
+    }
+  }
+
+  // =====================================================
+  // Notes (child of Tickets / Projects / Companies)
+  // =====================================================
+
+  /**
+   * Parent entity mapping for note operations.
+   */
+  private noteParent(parentField: string): { parent: string; bodyField: string } {
+    const map: Record<string, { parent: string; bodyField: string }> = {
+      ticketId:  { parent: 'Tickets',   bodyField: 'ticketID' },
+      projectId: { parent: 'Projects',  bodyField: 'projectID' },
+      accountId: { parent: 'Companies', bodyField: 'companyID' },
+    };
+    const m = map[parentField];
+    if (!m) throw new Error(`Unknown parent field for note operation: ${parentField}`);
+    return m;
+  }
+
+  private async getNoteImpl(parentField: string, parentId: number, noteId: number): Promise<any> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting note - ${parentField}: ${parentId}, noteID: ${noteId}`);
+      const { parent } = this.noteParent(parentField);
+      return await http.childGet<any>(parent, parentId, 'Notes', noteId);
+    } catch (error) {
+      this.logger.error(`Failed to get note ${noteId} for ${parentField}=${parentId}:`, error);
+      throw error;
+    }
+  }
+
+  private async searchNotesImpl(
+    parentField: string,
+    parentId: number,
+    options: AutotaskQueryOptionsExtended = {}
+  ): Promise<any[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Searching notes for ${parentField}=${parentId}:`, options);
+      const { parent } = this.noteParent(parentField);
+      const notes = await http.childQuery<any>(
+        parent,
+        parentId,
+        'Notes',
+        MATCH_ALL,
+        { maxRecords: options.pageSize || 25 }
+      );
+      this.logger.info(`Retrieved ${notes.length} notes for ${parentField}=${parentId}`);
+      return notes;
+    } catch (error) {
+      this.logger.error(`Failed to search notes for ${parentField}=${parentId}:`, error);
+      throw error;
+    }
+  }
+
+  private async createNoteImpl(
+    parentField: string,
+    parentId: number,
+    note: Record<string, any>
+  ): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Creating note for ${parentField}=${parentId}:`, note);
+      const { parent, bodyField } = this.noteParent(parentField);
+      const noteData = { ...note, [bodyField]: parentId };
+      const id = await http.childCreate(parent, parentId, 'Notes', noteData);
+      this.logger.info(`Note created with ID: ${id} for ${parentField}=${parentId}`);
+      return id;
+    } catch (error) {
+      this.logger.error(`Failed to create note for ${parentField}=${parentId}:`, error);
+      throw error;
+    }
+  }
+
+  async getTicketNote(ticketId: number, noteId: number): Promise<AutotaskTicketNote | null> {
+    return this.getNoteImpl('ticketId', ticketId, noteId);
+  }
+  async searchTicketNotes(ticketId: number, opts?: AutotaskQueryOptionsExtended): Promise<AutotaskTicketNote[]> {
+    return this.searchNotesImpl('ticketId', ticketId, opts);
+  }
+  async createTicketNote(ticketId: number, note: Partial<AutotaskTicketNote>): Promise<number> {
+    return this.createNoteImpl('ticketId', ticketId, note as Record<string, any>);
+  }
+
+  async getProjectNote(projectId: number, noteId: number): Promise<AutotaskProjectNote | null> {
+    return this.getNoteImpl('projectId', projectId, noteId);
+  }
+  async searchProjectNotes(projectId: number, opts?: AutotaskQueryOptionsExtended): Promise<AutotaskProjectNote[]> {
+    return this.searchNotesImpl('projectId', projectId, opts);
+  }
+  async createProjectNote(projectId: number, note: Partial<AutotaskProjectNote>): Promise<number> {
+    return this.createNoteImpl('projectId', projectId, note as Record<string, any>);
+  }
+
+  async getCompanyNote(companyId: number, noteId: number): Promise<AutotaskCompanyNote | null> {
+    return this.getNoteImpl('accountId', companyId, noteId);
+  }
+  async searchCompanyNotes(companyId: number, opts?: AutotaskQueryOptionsExtended): Promise<AutotaskCompanyNote[]> {
+    return this.searchNotesImpl('accountId', companyId, opts);
+  }
+  async createCompanyNote(companyId: number, note: Partial<AutotaskCompanyNote>): Promise<number> {
+    return this.createNoteImpl('accountId', companyId, note as Record<string, any>);
+  }
+
+  // =====================================================
+  // Ticket Checklist Items (child of Tickets)
+  // =====================================================
+
+  async searchTicketChecklistItems(ticketId: number): Promise<AutotaskTicketChecklistItem[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Listing checklist items for ticket ${ticketId}`);
+      const items = await http.childQuery<AutotaskTicketChecklistItem>(
+        'Tickets',
+        ticketId,
+        'ChecklistItems',
+        MATCH_ALL,
+        { maxRecords: 500 }
+      );
+      this.logger.info(`Retrieved ${items.length} checklist items for ticket ${ticketId}`);
+      return items;
+    } catch (error) {
+      this.logger.error(`Failed to list checklist items for ticket ${ticketId}:`, error);
+      throw error;
+    }
+  }
+
+  async createTicketChecklistItem(
+    ticketId: number,
+    data: Partial<AutotaskTicketChecklistItem>
+  ): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Creating checklist item on ticket ${ticketId}:`, data);
+      const body = { ...data, ticketID: ticketId };
+      const id = await http.childCreate('Tickets', ticketId, 'ChecklistItems', body);
+      this.logger.info(`Checklist item created with ID ${id} on ticket ${ticketId}`);
+      return id;
+    } catch (error) {
+      this.logger.error(`Failed to create checklist item on ticket ${ticketId}:`, error);
+      throw error;
+    }
+  }
+
+  async updateTicketChecklistItem(
+    ticketId: number,
+    itemId: number,
+    data: Partial<AutotaskTicketChecklistItem>
+  ): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Updating checklist item ${itemId} on ticket ${ticketId}:`, data);
+      const body = { ...data, ticketID: ticketId } as Record<string, any>;
+      await http.childUpdate('Tickets', ticketId, 'ChecklistItems', itemId, body);
+      this.logger.info(`Checklist item ${itemId} updated on ticket ${ticketId}`);
+    } catch (error) {
+      this.logger.error(`Failed to update checklist item ${itemId} on ticket ${ticketId}:`, error);
+      throw error;
+    }
+  }
+
+  async deleteTicketChecklistItem(ticketId: number, itemId: number): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Deleting checklist item ${itemId} from ticket ${ticketId}`);
+      await http.childDelete('Tickets', ticketId, 'ChecklistItems', itemId);
+      this.logger.info(`Checklist item ${itemId} deleted from ticket ${ticketId}`);
+    } catch (error) {
+      this.logger.error(`Failed to delete checklist item ${itemId} from ticket ${ticketId}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Ticket Attachments (child of Tickets)
+  // =====================================================
+
+  // Default cap on inline attachment data (base64-encoded length). 750 KB of
+  // base64 ≈ 560 KB raw, leaving headroom for the JSON envelope under typical
+  // MCP client tool-result limits (~1 MB). Callable overrides via options.
+  private static readonly DEFAULT_MAX_INLINE_ATTACHMENT_BASE64 = 750_000;
+
+  async getTicketAttachment(
+    ticketId: number,
+    attachmentId: number,
+    options: { includeData?: boolean; maxInlineBase64Bytes?: number } = {}
+  ): Promise<(AutotaskTicketAttachment & { dataOmittedReason?: string }) | null> {
+    const includeData = options.includeData ?? false;
+    const maxInlineBase64Bytes =
+      options.maxInlineBase64Bytes ?? AutotaskService.DEFAULT_MAX_INLINE_ATTACHMENT_BASE64;
+
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(
+        `Getting ticket attachment - TicketID: ${ticketId}, AttachmentID: ${attachmentId}, includeData: ${includeData}`
+      );
+
+      if (!includeData) {
+        // The child endpoint never populates the `data` field — using it for
+        // the metadata-only path sidesteps the binary download entirely.
+        return await http.childGet<AutotaskTicketAttachment>(
+          'Tickets',
+          ticketId,
+          'Attachments',
+          attachmentId
+        );
+      }
+
+      // Only the top-level entity endpoint populates `data`; the child endpoint
+      // omits it regardless of any query parameters.
+      const attachment = await http.get<AutotaskTicketAttachment>('TicketAttachments', attachmentId);
+      if (!attachment) return null;
+
+      // The top-level endpoint accepts any attachment ID, so we have to enforce
+      // parent scope ourselves to honor the (ticketId, attachmentId) contract.
+      if (typeof attachment.ticketID === 'number' && attachment.ticketID !== ticketId) {
+        this.logger.warn(
+          `Ticket attachment ${attachmentId} belongs to ticket ${attachment.ticketID}, not ${ticketId}. Returning null.`
+        );
+        return null;
+      }
+
+      // Oversized binaries arrive truncated/garbled at the MCP client. Strip
+      // and surface a reason so the caller knows to fetch out-of-band rather
+      // than wondering why the response is broken.
+      if (typeof attachment.data === 'string' && attachment.data.length > maxInlineBase64Bytes) {
+        const decodedBytes = Buffer.byteLength(attachment.data, 'base64');
+        const reason =
+          `Attachment data omitted: base64 length ${attachment.data.length} bytes ` +
+          `(${decodedBytes} bytes decoded) exceeds inline limit of ${maxInlineBase64Bytes} bytes. ` +
+          `Fetch directly from Autotask, or call again with a larger maxInlineBase64Bytes (caveat: ` +
+          `the MCP client may reject the oversized response).`;
+        this.logger.warn(
+          `getTicketAttachment: stripping oversized data for attachment ${attachmentId} (${attachment.data.length} base64 bytes)`
+        );
+        const { data: _omitted, ...rest } = attachment;
+        return { ...rest, dataOmittedReason: reason };
+      }
+
+      return attachment;
+    } catch (error) {
+      this.logger.error(`Failed to get ticket attachment ${attachmentId} for ticket ${ticketId}:`, error);
+      throw error;
+    }
+  }
+
+  async searchTicketAttachments(
+    ticketId: number,
+    options: AutotaskQueryOptionsExtended = {}
+  ): Promise<AutotaskTicketAttachment[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Searching ticket attachments for ticket ${ticketId}:`, options);
+      const attachments = await http.childQuery<AutotaskTicketAttachment>(
+        'Tickets',
+        ticketId,
+        'Attachments',
+        MATCH_ALL,
+        { maxRecords: options.pageSize || 10 }
+      );
+      this.logger.info(`Retrieved ${attachments.length} ticket attachments`);
+      return attachments;
+    } catch (error) {
+      this.logger.error(`Failed to search ticket attachments for ticket ${ticketId}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Ticket Note Attachments (child of TicketNotes)
+  //
+  // Attachments/pasted images on a NOTE, not the ticket itself — closes the
+  // gap where a note's `description` is empty but the note actually carries
+  // one or more files/screenshots in the Autotask UI (autotask-mcp#297).
+  // Same top-level-populates-data / child-omits-data split as
+  // getTicketAttachment above: verified live against
+  // /TicketNoteAttachments/entityInformation/fields (field names differ from
+  // AutotaskTicketAttachment — title/fullPath/attachDate here, not
+  // fileName/createDate), but no live note with an actual attachment was
+  // available to empirically confirm the child endpoint omits `data` the
+  // same way it does for ticket attachments — the split is applied on the
+  // strength of Autotask's consistent attachment-entity design, not a
+  // second empirical reproduction.
+  // =====================================================
+
+  /**
+   * Get an attachment on a ticket note. With `includeData` false (default),
+   * hits the cheap `TicketNotes/{id}/Attachments/{id}` child endpoint and
+   * returns metadata only — it never populates `data` regardless of query
+   * parameters. With `includeData` true, hits the top-level
+   * `TicketNoteAttachments/{id}` entity (the only endpoint that populates
+   * `data`) and enforces that the attachment actually belongs to
+   * `ticketNoteId` — `ticketNoteID` is an optional field on this entity
+   * (Autotask's own field metadata marks it `isRequired: false`, since a
+   * TicketNoteAttachment-shaped row can in principle belong to a different
+   * parent), so scope is verified with strict equality against the
+   * requested id, never merely "present and different" — an omitted or
+   * non-numeric `ticketNoteID` is rejected, not passed through. Base64
+   * payloads longer than `maxInlineBase64Bytes` (default 750,000, ~560 KB
+   * raw) are stripped from the response and replaced with a
+   * `dataOmittedReason` explaining why, since an oversized inline payload
+   * can exceed a typical MCP client's tool-result size limit. Returns
+   * `null` when the attachment does not exist or does not belong to the
+   * given note.
+   */
+  async getTicketNoteAttachment(
+    ticketNoteId: number,
+    attachmentId: number,
+    options: { includeData?: boolean; maxInlineBase64Bytes?: number } = {}
+  ): Promise<(AutotaskTicketNoteAttachment & { dataOmittedReason?: string }) | null> {
+    const includeData = options.includeData ?? false;
+    const maxInlineBase64Bytes =
+      options.maxInlineBase64Bytes ?? AutotaskService.DEFAULT_MAX_INLINE_ATTACHMENT_BASE64;
+
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(
+        `Getting ticket note attachment - TicketNoteID: ${ticketNoteId}, AttachmentID: ${attachmentId}, includeData: ${includeData}`
+      );
+
+      if (!includeData) {
+        // The child endpoint never populates the `data` field — using it for
+        // the metadata-only path sidesteps the binary download entirely.
+        return await http.childGet<AutotaskTicketNoteAttachment>(
+          'TicketNotes',
+          ticketNoteId,
+          'Attachments',
+          attachmentId
+        );
+      }
+
+      // Only the top-level entity endpoint populates `data`; the child endpoint
+      // omits it regardless of any query parameters.
+      const attachment = await http.get<AutotaskTicketNoteAttachment>('TicketNoteAttachments', attachmentId);
+      if (!attachment) return null;
+
+      // The top-level endpoint accepts any attachment ID, so we have to enforce
+      // parent scope ourselves to honor the (ticketNoteId, attachmentId) contract.
+      // Fail CLOSED: ticketNoteID is documented as optional on this entity
+      // (Autotask field metadata: isRequired: false), so a row that omits it
+      // must be rejected too, not passed through because it isn't a
+      // *mismatched* number. Strict equality catches missing, non-numeric,
+      // AND mismatched values in one check — the earlier `typeof === 'number'
+      // && !==` form let an attachment with no ticketNoteID through
+      // unverified (CodeRabbit PR #300 review).
+      if (attachment.ticketNoteID !== ticketNoteId) {
+        this.logger.warn(
+          `Ticket note attachment ${attachmentId} does not belong to note ${ticketNoteId} (ticketNoteID: ${attachment.ticketNoteID ?? 'missing'}). Returning null.`
+        );
+        return null;
+      }
+
+      // Oversized binaries arrive truncated/garbled at the MCP client. Strip
+      // and surface a reason so the caller knows to fetch out-of-band rather
+      // than wondering why the response is broken.
+      if (typeof attachment.data === 'string' && attachment.data.length > maxInlineBase64Bytes) {
+        const decodedBytes = Buffer.byteLength(attachment.data, 'base64');
+        const reason =
+          `Attachment data omitted: base64 length ${attachment.data.length} bytes ` +
+          `(${decodedBytes} bytes decoded) exceeds inline limit of ${maxInlineBase64Bytes} bytes. ` +
+          `Fetch directly from Autotask, or call again with a larger maxInlineBase64Bytes (caveat: ` +
+          `the MCP client may reject the oversized response).`;
+        this.logger.warn(
+          `getTicketNoteAttachment: stripping oversized data for attachment ${attachmentId} (${attachment.data.length} base64 bytes)`
+        );
+        const { data: _omitted, ...rest } = attachment;
+        return { ...rest, dataOmittedReason: reason };
+      }
+
+      return attachment;
+    } catch (error) {
+      this.logger.error(`Failed to get ticket note attachment ${attachmentId} for note ${ticketNoteId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * List attachment metadata for a ticket note (child of TicketNotes). Never
+   * returns `data` — use getTicketNoteAttachment with includeData:true for
+   * that. `options.pageSize` caps the result count (default 10, max
+   * enforced by AUTOTASK_MAX_PAGE_SIZE via childQuery). Each call scopes to
+   * one note; the caller must iterate per note, not per ticket.
+   */
+  async searchTicketNoteAttachments(
+    ticketNoteId: number,
+    options: AutotaskQueryOptionsExtended = {}
+  ): Promise<AutotaskTicketNoteAttachment[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Searching ticket note attachments for note ${ticketNoteId}:`, options);
+      const attachments = await http.childQuery<AutotaskTicketNoteAttachment>(
+        'TicketNotes',
+        ticketNoteId,
+        'Attachments',
+        MATCH_ALL,
+        { maxRecords: options.pageSize || 10 }
+      );
+      this.logger.info(`Retrieved ${attachments.length} ticket note attachments`);
+      return attachments;
+    } catch (error) {
+      this.logger.error(`Failed to search ticket note attachments for note ${ticketNoteId}:`, error);
+      throw error;
+    }
+  }
+
+  async createTicketAttachment(
+    ticketId: number,
+    data: AutotaskTicketAttachmentCreateRequest
+  ): Promise<number> {
+    const MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024; // 3 MB
+
+    if (!data || typeof data.data !== 'string' || data.data.length === 0) {
+      throw new Error('createTicketAttachment: `data` (base64-encoded file content) is required');
+    }
+    if (!data.title) {
+      throw new Error('createTicketAttachment: `title` is required');
+    }
+
+    let decodedLength: number;
+    try {
+      const buf = Buffer.from(data.data, 'base64');
+      if (buf.toString('base64').replace(/=+$/, '') !== data.data.replace(/\s+/g, '').replace(/=+$/, '')) {
+        throw new Error('invalid base64');
+      }
+      decodedLength = buf.length;
+    } catch {
+      throw new Error('createTicketAttachment: `data` is not valid base64-encoded content');
+    }
+
+    if (decodedLength === 0) {
+      throw new Error('createTicketAttachment: decoded attachment is empty');
+    }
+    if (decodedLength > MAX_ATTACHMENT_BYTES) {
+      throw new Error(
+        `createTicketAttachment: attachment is ${decodedLength} bytes which exceeds the Autotask 3MB (${MAX_ATTACHMENT_BYTES} byte) limit for ticket attachments`
+      );
+    }
+
+    const http = await this.ensureClient();
+
+    const payload = {
+      title: data.title,
+      fullPath: data.fullPath || data.title,
+      data: data.data,
+      attachmentType: data.attachmentType || 'FILE_ATTACHMENT',
+      contentType: data.contentType,
+      publish: data.publish ?? 1,
+      parentId: ticketId,
+      parentType: 4 // Ticket
+    };
+
+    try {
+      this.logger.info(
+        `Creating ticket attachment - ticketId=${ticketId} title="${data.title}" bytes=${decodedLength}`
+      );
+      const id = await http.childCreate('Tickets', ticketId, 'Attachments', payload);
+      this.logger.info(`Ticket attachment created with ID: ${id} for ticket ${ticketId}`);
+      return id;
+    } catch (error) {
+      this.logger.error(`Failed to create ticket attachment for ticket ${ticketId}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Expense Reports / Items
+  // =====================================================
+
+  async getExpenseReport(id: number): Promise<AutotaskExpenseReport | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting expense report with ID: ${id}`);
+      return await http.get<AutotaskExpenseReport>('ExpenseReports', id);
+    } catch (error) {
+      this.logger.error(`Failed to get expense report ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchExpenseReports(options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskExpenseReport[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching expense reports with options:', options);
+      const filters: QueryFilter[] = [];
+      if (options.submitterId) {
+        filters.push({ field: 'resourceId', op: 'eq', value: options.submitterId });
+      }
+      if (options.status) {
+        filters.push({ field: 'status', op: 'eq', value: options.status });
+      }
+      const reports = await http.query<AutotaskExpenseReport>(
+        'ExpenseReports',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: options.pageSize || 25 }
+      );
+      this.logger.info(`Retrieved ${reports.length} expense reports`);
+      return reports;
+    } catch (error) {
+      this.logger.error('Failed to search expense reports:', error);
+      throw error;
+    }
+  }
+
+  async createExpenseReport(report: Partial<AutotaskExpenseReport>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating expense report:', report);
+      const id = await http.create('ExpenseReports', report);
+      this.logger.info(`Expense report created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create expense report:', error);
+      throw error;
+    }
+  }
+
+  async getExpenseItem(itemId: number): Promise<AutotaskExpenseItem | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting expense item with ID: ${itemId}`);
+      return await http.get<AutotaskExpenseItem>('ExpenseItems', itemId);
+    } catch (error) {
+      this.logger.error(`Failed to get expense item ${itemId}:`, error);
+      throw error;
+    }
+  }
+
+  async searchExpenseItems(options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskExpenseItem[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching expense items with options:', options);
+      const filters: QueryFilter[] = [];
+      if (options.expenseReportId) {
+        filters.push({ field: 'expenseReportID', op: 'eq', value: options.expenseReportId });
+      }
+      if (options.startDate) {
+        filters.push({ field: 'expenseDate', op: 'gte', value: options.startDate });
+      }
+      if (options.endDate) {
+        filters.push({ field: 'expenseDate', op: 'lte', value: options.endDate });
+      }
+      const items = await http.query<AutotaskExpenseItem>(
+        'ExpenseItems',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: options.pageSize || 25 }
+      );
+      this.logger.info(`Retrieved ${items.length} expense items`);
+      return items;
+    } catch (error) {
+      this.logger.error('Failed to search expense items:', error);
+      throw error;
+    }
+  }
+
+  async createExpenseItem(item: Partial<AutotaskExpenseItem>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating expense item:', item);
+      const id = await http.create('ExpenseItems', item);
+      this.logger.info(`Expense item created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create expense item:', error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Quotes
+  // =====================================================
+
+  async getQuote(id: number): Promise<AutotaskQuote | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting quote with ID: ${id}`);
+      return await http.get<AutotaskQuote>('Quotes', id);
+    } catch (error) {
+      this.logger.error(`Failed to get quote ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchQuotes(options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskQuote[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching quotes with options:', options);
+      const filters: QueryFilter[] = [];
+      if (options.companyId) {
+        // The Quotes entity has NO account* field — its company link is
+        // `companyID` (confirmed via entityInformation/fields). Filtering on
+        // `accountId` returns HTTP 500 "Unable to find accountId in the
+        // Quote Entity" on every tenant.
+        filters.push({ field: 'companyID', op: 'eq', value: options.companyId });
+      }
+      if (options.contactId) {
+        filters.push({ field: 'contactID', op: 'eq', value: options.contactId });
+      }
+      if (options.opportunityId) {
+        filters.push({ field: 'opportunityID', op: 'eq', value: options.opportunityId });
+      }
+      if (options.searchTerm) {
+        filters.push({ field: 'description', op: 'contains', value: options.searchTerm });
+      }
+      const quotes = await http.query<AutotaskQuote>(
+        'Quotes',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: options.pageSize || 25 }
+      );
+      this.logger.info(`Retrieved ${quotes.length} quotes`);
+      return quotes;
+    } catch (error) {
+      this.logger.error('Failed to search quotes:', error);
+      throw error;
+    }
+  }
+
+  async createQuote(quote: Partial<AutotaskQuote>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      // Autotask requires location IDs on the quote. Auto-populate from the
+      // company's first location if the caller didn't supply them.
+      if (
+        quote.companyID &&
+        (!quote.billToLocationID || !quote.shipToLocationID || !quote.soldToLocationID)
+      ) {
+        try {
+          const locations = await http.query<{ id: number }>(
+            'CompanyLocations',
+            [{ op: 'eq', field: 'companyID', value: quote.companyID }],
+            { maxRecords: 10 }
+          );
+          if (locations.length > 0) {
+            const defaultLocationId = locations[0].id;
+            if (!quote.billToLocationID) quote.billToLocationID = defaultLocationId;
+            if (!quote.shipToLocationID) quote.shipToLocationID = defaultLocationId;
+            if (!quote.soldToLocationID) quote.soldToLocationID = defaultLocationId;
+          }
+        } catch (locError) {
+          this.logger.warn('Could not auto-populate location IDs for quote:', locError);
+        }
+      }
+
+      this.logger.debug('Creating quote:', quote);
+      const id = await http.create('Quotes', quote);
+      this.logger.info(`Quote created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create quote:', error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Opportunities
+  // =====================================================
+
+  async getOpportunity(id: number): Promise<AutotaskOpportunity | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting opportunity with ID: ${id}`);
+      return await http.get<AutotaskOpportunity>('Opportunities', id);
+    } catch (error) {
+      this.logger.error(`Failed to get opportunity ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchOpportunities(options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskOpportunity[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching opportunities with options:', options);
+      const filters: QueryFilter[] = [];
+      if (options.companyId) {
+        filters.push({ field: 'companyID', op: 'eq', value: options.companyId });
+      }
+      if (options.searchTerm) {
+        filters.push({ field: 'title', op: 'contains', value: options.searchTerm });
+      }
+      if (options.status !== undefined) {
+        filters.push({ field: 'status', op: 'eq', value: options.status });
+      }
+      const items = await http.query<AutotaskOpportunity>(
+        'Opportunities',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: options.pageSize || 25 }
+      );
+      this.logger.info(`Retrieved ${items.length} opportunities`);
+      return items;
+    } catch (error) {
+      this.logger.error('Failed to search opportunities:', error);
+      throw error;
+    }
+  }
+
+  async createOpportunity(opportunity: Record<string, any>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating opportunity:', opportunity);
+      const oppData: Record<string, any> = {
+        title: opportunity.title,
+        companyID: opportunity.companyID,
+        ownerResourceID: opportunity.ownerResourceID,
+        status: opportunity.status,
+        stage: opportunity.stage,
+        projectedCloseDate: opportunity.projectedCloseDate,
+        startDate: opportunity.startDate,
+        probability: opportunity.probability ?? 50,
+        amount: opportunity.amount ?? 0,
+        cost: opportunity.cost ?? 0,
+        useQuoteTotals: opportunity.useQuoteTotals ?? true,
+      };
+      if (opportunity.totalAmountMonths) oppData.totalAmountMonths = opportunity.totalAmountMonths;
+      if (opportunity.contactID) oppData.contactID = opportunity.contactID;
+      if (opportunity.description) oppData.description = opportunity.description;
+      if (opportunity.opportunityCategoryID) oppData.opportunityCategoryID = opportunity.opportunityCategoryID;
+
+      const id = await http.create('Opportunities', oppData);
+      this.logger.info(`Created opportunity with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create opportunity:', error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Products / Services / Service Bundles (read)
+  // =====================================================
+
+  async getProduct(id: number): Promise<AutotaskProduct | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting product with ID: ${id}`);
+      return await http.get<AutotaskProduct>('Products', id);
+    } catch (error) {
+      this.logger.error(`Failed to get product ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchProducts(options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskProduct[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching products with options:', options);
+      const filters: QueryFilter[] = [];
+      if (options.searchTerm) {
+        filters.push({ field: 'name', op: 'contains', value: options.searchTerm });
+      }
+      if (options.isActive !== undefined) {
+        filters.push({ field: 'isActive', op: 'eq', value: options.isActive });
+      }
+      const items = await http.query<AutotaskProduct>(
+        'Products',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: options.pageSize || 25 }
+      );
+      this.logger.info(`Retrieved ${items.length} products`);
+      return items;
+    } catch (error) {
+      this.logger.error('Failed to search products:', error);
+      throw error;
+    }
+  }
+
+  async getService(id: number): Promise<AutotaskServiceEntity | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting service with ID: ${id}`);
+      return await http.get<AutotaskServiceEntity>('Services', id);
+    } catch (error) {
+      this.logger.error(`Failed to get service ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchServices(options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskServiceEntity[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching services with options:', options);
+      const filters: QueryFilter[] = [];
+      if (options.searchTerm) {
+        filters.push({ field: 'name', op: 'contains', value: options.searchTerm });
+      }
+      if (options.isActive !== undefined) {
+        filters.push({ field: 'isActive', op: 'eq', value: options.isActive });
+      }
+      const items = await http.query<AutotaskServiceEntity>(
+        'Services',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: options.pageSize || 25 }
+      );
+      this.logger.info(`Retrieved ${items.length} services`);
+      return items;
+    } catch (error) {
+      this.logger.error('Failed to search services:', error);
+      throw error;
+    }
+  }
+
+  async getServiceBundle(id: number): Promise<AutotaskServiceBundle | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting service bundle with ID: ${id}`);
+      return await http.get<AutotaskServiceBundle>('ServiceBundles', id);
+    } catch (error) {
+      this.logger.error(`Failed to get service bundle ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchServiceBundles(options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskServiceBundle[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching service bundles with options:', options);
+      const filters: QueryFilter[] = [];
+      if (options.searchTerm) {
+        filters.push({ field: 'name', op: 'contains', value: options.searchTerm });
+      }
+      if (options.isActive !== undefined) {
+        filters.push({ field: 'isActive', op: 'eq', value: options.isActive });
+      }
+      const items = await http.query<AutotaskServiceBundle>(
+        'ServiceBundles',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: options.pageSize || 25 }
+      );
+      this.logger.info(`Retrieved ${items.length} service bundles`);
+      return items;
+    } catch (error) {
+      this.logger.error('Failed to search service bundles:', error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Quote Items (child of Quotes for create/delete)
+  // =====================================================
+
+  async getQuoteItem(id: number): Promise<AutotaskQuoteItem | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting quote item with ID: ${id}`);
+      return await http.get<AutotaskQuoteItem>('QuoteItems', id);
+    } catch (error) {
+      this.logger.error(`Failed to get quote item ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchQuoteItems(options: AutotaskQueryOptionsExtended & { quoteId?: number } = {}): Promise<AutotaskQuoteItem[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching quote items with options:', options);
+      const filters: QueryFilter[] = [];
+      if (options.quoteId) {
+        filters.push({ field: 'quoteID', op: 'eq', value: options.quoteId });
+      }
+      if (options.searchTerm) {
+        filters.push({ field: 'name', op: 'contains', value: options.searchTerm });
+      }
+      const items = await http.query<AutotaskQuoteItem>(
+        'QuoteItems',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: options.pageSize || 50 }
+      );
+      this.logger.info(`Retrieved ${items.length} quote items`);
+      return items;
+    } catch (error) {
+      this.logger.error('Failed to search quote items:', error);
+      throw error;
+    }
+  }
+
+  async createQuoteItem(item: Partial<AutotaskQuoteItem>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      // Auto-determine quoteItemType based on which ID field is set.
+      let quoteItemType = item.quoteItemType;
+      if (!quoteItemType) {
+        if (item.serviceID) quoteItemType = 11;
+        else if (item.serviceBundleID) quoteItemType = 12;
+        else if (item.productID) quoteItemType = 1;
+        else if (item.chargeID) quoteItemType = 2;
+        else if (item.laborID) quoteItemType = 3;
+        else if (item.expenseID) quoteItemType = 4;
+        else if (item.shippingID) quoteItemType = 6;
+        else quoteItemType = 2;
+      }
+
+      if (!item.quoteID) {
+        throw new Error('quoteID is required to create a quote item');
+      }
+
+      const quoteItem = {
+        unitDiscount: 0,
+        lineDiscount: 0,
+        percentageDiscount: 0,
+        isOptional: false,
+        ...item,
+        quoteItemType: item.quoteItemType || quoteItemType,
+      };
+      this.logger.debug('Creating quote item:', quoteItem);
+      // QuoteItems are child of Quotes: POST /Quotes/{quoteId}/Items
+      const id = await http.childCreate('Quotes', item.quoteID, 'Items', quoteItem);
+      this.logger.info(`Quote item created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create quote item:', error);
+      throw error;
+    }
+  }
+
+  async updateQuoteItem(id: number, item: Partial<AutotaskQuoteItem>): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Updating quote item ${id}:`, item);
+      await http.update('QuoteItems', id, item as Record<string, any>);
+      this.logger.info(`Quote item ${id} updated`);
+    } catch (error) {
+      this.logger.error(`Failed to update quote item ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async deleteQuoteItem(quoteId: number, id: number): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Deleting quote item ${id} from quote ${quoteId}`);
+      await http.childDelete('Quotes', quoteId, 'Items', id);
+      this.logger.info(`Quote item ${id} deleted from quote ${quoteId}`);
+    } catch (error) {
+      this.logger.error(`Failed to delete quote item ${id}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Billing Items
+  // =====================================================
+
+  async getBillingItem(id: number): Promise<AutotaskBillingItem | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting billing item with ID: ${id}`);
+      return await http.get<AutotaskBillingItem>('BillingItems', id);
+    } catch (error) {
+      this.logger.error(`Failed to get billing item ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchBillingItems(options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskBillingItem[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching billing items with options:', options);
+      const filters: QueryFilter[] = [];
+
+      if (options.companyId !== undefined) {
+        filters.push({ op: 'eq', field: 'companyID', value: options.companyId });
+      }
+      if ((options as any).ticketId !== undefined) {
+        filters.push({ op: 'eq', field: 'ticketID', value: (options as any).ticketId });
+      }
+      if ((options as any).projectId !== undefined) {
+        filters.push({ op: 'eq', field: 'projectID', value: (options as any).projectId });
+      }
+      if ((options as any).contractId !== undefined) {
+        filters.push({ op: 'eq', field: 'contractID', value: (options as any).contractId });
+      }
+      if ((options as any).invoiceId !== undefined) {
+        filters.push({ op: 'eq', field: 'invoiceID', value: (options as any).invoiceId });
+      }
+      if ((options as any).isInvoiced !== undefined) {
+        filters.push({ op: (options as any).isInvoiced ? 'exist' : 'notExist', field: 'invoiceID' });
+      }
+      if ((options as any).dateFrom) {
+        filters.push({ op: 'gte', field: 'itemDate', value: (options as any).dateFrom });
+      }
+      if ((options as any).dateTo) {
+        filters.push({ op: 'lte', field: 'itemDate', value: (options as any).dateTo });
+      }
+      if ((options as any).postedAfter) {
+        filters.push({ op: 'gte', field: 'postedDate', value: (options as any).postedAfter });
+      }
+      if ((options as any).postedBefore) {
+        filters.push({ op: 'lte', field: 'postedDate', value: (options as any).postedBefore });
+      }
+
+      const pageSize = Math.min(options.pageSize || 25, 500);
+      const items = await http.query<AutotaskBillingItem>(
+        'BillingItems',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: pageSize }
+      );
+      this.logger.info(`Retrieved ${items.length} billing items`);
+      return items;
+    } catch (error) {
+      this.logger.error('Failed to search billing items:', error);
+      throw error;
+    }
+  }
+
+  async searchBillingItemApprovalLevels(
+    options: AutotaskQueryOptionsExtended = {}
+  ): Promise<AutotaskBillingItemApprovalLevel[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching billing item approval levels with options:', options);
+      const filters: QueryFilter[] = [];
+      if ((options as any).timeEntryId !== undefined) {
+        filters.push({ op: 'eq', field: 'timeEntryID', value: (options as any).timeEntryId });
+      }
+      if ((options as any).approvalResourceId !== undefined) {
+        filters.push({ op: 'eq', field: 'approvalResourceID', value: (options as any).approvalResourceId });
+      }
+      if ((options as any).approvalLevel !== undefined) {
+        filters.push({ op: 'eq', field: 'approvalLevel', value: (options as any).approvalLevel });
+      }
+      if ((options as any).approvedAfter) {
+        filters.push({ op: 'gte', field: 'approvalDateTime', value: (options as any).approvedAfter });
+      }
+      if ((options as any).approvedBefore) {
+        filters.push({ op: 'lte', field: 'approvalDateTime', value: (options as any).approvedBefore });
+      }
+
+      const pageSize = Math.min(options.pageSize || 25, 500);
+      const items = await http.query<AutotaskBillingItemApprovalLevel>(
+        'BillingItemApprovalLevels',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: pageSize }
+      );
+      this.logger.info(`Retrieved ${items.length} billing item approval levels`);
+      return items;
+    } catch (error) {
+      this.logger.error('Failed to search billing item approval levels:', error);
+      throw error;
+    }
+  }
+
+  async searchTimeEntries(options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskTimeEntry[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching time entries with options:', options);
+      const filters: QueryFilter[] = [];
+
+      if ((options as any).resourceId !== undefined) {
+        filters.push({ op: 'eq', field: 'resourceID', value: (options as any).resourceId });
+      }
+      if ((options as any).ticketId !== undefined) {
+        filters.push({ op: 'eq', field: 'ticketID', value: (options as any).ticketId });
+      }
+      // No projectID filter: TimeEntries has no such field (issue #277), so the
+      // clause could only be dropped or rejected by Autotask — never honoured.
+      if ((options as any).taskId !== undefined) {
+        filters.push({ op: 'eq', field: 'taskID', value: (options as any).taskId });
+      }
+      if ((options as any).dateWorkedAfter) {
+        filters.push({ op: 'gte', field: 'dateWorked', value: (options as any).dateWorkedAfter });
+      }
+      if ((options as any).dateWorkedBefore) {
+        filters.push({ op: 'lte', field: 'dateWorked', value: (options as any).dateWorkedBefore });
+      }
+
+      const approvalStatus = (options as any).approvalStatus;
+      if (approvalStatus === 'unapproved') {
+        filters.push({ op: 'eq', field: 'billingApprovalDateTime', value: null });
+      } else if (approvalStatus === 'approved') {
+        filters.push({ op: 'isnotnull', field: 'billingApprovalDateTime' });
+      }
+
+      if ((options as any).billable !== undefined) {
+        filters.push({ op: 'eq', field: 'isNonBillable', value: !(options as any).billable });
+      }
+
+      const pageSize = Math.min(options.pageSize || 25, 500);
+      const items = await http.query<AutotaskTimeEntry>(
+        'TimeEntries',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: pageSize }
+      );
+      this.logger.info(`Retrieved ${items.length} time entries`);
+      return items;
+    } catch (error) {
+      this.logger.error('Failed to search time entries:', error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Service Calls
+  // =====================================================
+
+  async getServiceCall(id: number): Promise<AutotaskServiceCall | null> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting service call with ID: ${id}`);
+      return await http.get<AutotaskServiceCall>('ServiceCalls', id);
+    } catch (error) {
+      this.logger.error(`Failed to get service call ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchServiceCalls(options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskServiceCall[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching service calls with options:', options);
+      const filters: QueryFilter[] = [];
+      if (options.status !== undefined) {
+        filters.push({ op: 'eq', field: 'status', value: options.status });
+      }
+      if (options.startDate) {
+        filters.push({ op: 'gte', field: 'startDateTime', value: options.startDate });
+      }
+      if (options.endDate) {
+        filters.push({ op: 'lte', field: 'endDateTime', value: options.endDate });
+      }
+      const pageSize = Math.min(options.pageSize || 25, 200);
+      const items = await http.query<AutotaskServiceCall>(
+        'ServiceCalls',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: pageSize }
+      );
+      this.logger.info(`Retrieved ${items.length} service calls`);
+      return items;
+    } catch (error) {
+      this.logger.error('Failed to search service calls:', error);
+      throw error;
+    }
+  }
+
+  async createServiceCall(data: Partial<AutotaskServiceCall>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating service call:', data);
+      const id = await http.create('ServiceCalls', data);
+      this.logger.info(`Service call created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create service call:', error);
+      throw error;
+    }
+  }
+
+  async updateServiceCall(id: number, updates: Partial<AutotaskServiceCall>): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Updating service call ${id}:`, updates);
+      await http.update('ServiceCalls', id, updates as Record<string, any>);
+      this.logger.info(`Service call ${id} updated successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to update service call ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async deleteServiceCall(id: number): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Deleting service call ${id}`);
+      await http.delete('ServiceCalls', id);
+      this.logger.info(`Service call ${id} deleted`);
+    } catch (error) {
+      this.logger.error(`Failed to delete service call ${id}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Service Call Tickets / Resources
+  // =====================================================
+
+  async searchServiceCallTickets(options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskServiceCallTicket[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching service call tickets with options:', options);
+      const filters: QueryFilter[] = [];
+      if ((options as any).serviceCallId !== undefined) {
+        filters.push({ op: 'eq', field: 'serviceCallID', value: (options as any).serviceCallId });
+      }
+      if ((options as any).ticketId !== undefined) {
+        filters.push({ op: 'eq', field: 'ticketID', value: (options as any).ticketId });
+      }
+      const pageSize = Math.min(options.pageSize || 25, 200);
+      const items = await http.query<AutotaskServiceCallTicket>(
+        'ServiceCallTickets',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: pageSize }
+      );
+      this.logger.info(`Retrieved ${items.length} service call tickets`);
+      return items;
+    } catch (error) {
+      this.logger.error('Failed to search service call tickets:', error);
+      throw error;
+    }
+  }
+
+  async createServiceCallTicket(data: Partial<AutotaskServiceCallTicket>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating service call ticket:', data);
+      const id = await http.create('ServiceCallTickets', data);
+      this.logger.info(`Service call ticket created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create service call ticket:', error);
+      throw error;
+    }
+  }
+
+  async deleteServiceCallTicket(id: number): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Deleting service call ticket ${id}`);
+      await http.delete('ServiceCallTickets', id);
+      this.logger.info(`Service call ticket ${id} deleted`);
+    } catch (error) {
+      this.logger.error(`Failed to delete service call ticket ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchServiceCallTicketResources(
+    options: AutotaskQueryOptionsExtended = {}
+  ): Promise<AutotaskServiceCallTicketResource[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Searching service call ticket resources with options:', options);
+      const filters: QueryFilter[] = [];
+      if ((options as any).serviceCallTicketId !== undefined) {
+        filters.push({ op: 'eq', field: 'serviceCallTicketID', value: (options as any).serviceCallTicketId });
+      }
+      if ((options as any).resourceId !== undefined) {
+        filters.push({ op: 'eq', field: 'resourceID', value: (options as any).resourceId });
+      }
+      const pageSize = Math.min(options.pageSize || 25, 200);
+      const items = await http.query<AutotaskServiceCallTicketResource>(
+        'ServiceCallTicketResources',
+        filters.length > 0 ? filters : MATCH_ALL,
+        { maxRecords: pageSize }
+      );
+      this.logger.info(`Retrieved ${items.length} service call ticket resources`);
+      return items;
+    } catch (error) {
+      this.logger.error('Failed to search service call ticket resources:', error);
+      throw error;
+    }
+  }
+
+  async createServiceCallTicketResource(data: Partial<AutotaskServiceCallTicketResource>): Promise<number> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug('Creating service call ticket resource:', data);
+      const id = await http.create('ServiceCallTicketResources', data);
+      this.logger.info(`Service call ticket resource created with ID: ${id}`);
+      return id;
+    } catch (error) {
+      this.logger.error('Failed to create service call ticket resource:', error);
+      throw error;
+    }
+  }
+
+  async deleteServiceCallTicketResource(id: number): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Deleting service call ticket resource ${id}`);
+      await http.delete('ServiceCallTicketResources', id);
+      this.logger.info(`Service call ticket resource ${id} deleted`);
+    } catch (error) {
+      this.logger.error(`Failed to delete service call ticket resource ${id}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Billing Codes / Departments (read-only helpers)
+  // =====================================================
+
+  async getBillingCode(id: number): Promise<AutotaskBillingCode | null> {
+    const http = await this.ensureClient();
+    try {
+      return await http.get<AutotaskBillingCode>('BillingCodes', id);
+    } catch (error) {
+      this.logger.error(`Failed to get billing code ${id}:`, error);
+      throw error;
+    }
+  }
+
+  async searchBillingCodes(_options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskBillingCode[]> {
+    const http = await this.ensureClient();
+    try {
+      return await http.query<AutotaskBillingCode>(
+        'BillingCodes',
+        [{ op: 'eq', field: 'isActive', value: true }],
+        { maxRecords: 500 }
+      );
+    } catch (error) {
+      this.logger.error('Failed to search billing codes:', error);
+      throw error;
+    }
+  }
+
+  async getDepartment(_id: number): Promise<AutotaskDepartment | null> {
+    throw new Error('Departments API not directly available in Autotask REST');
+  }
+
+  async searchDepartments(_options: AutotaskQueryOptionsExtended = {}): Promise<AutotaskDepartment[]> {
+    throw new Error('Departments API not directly available in Autotask REST');
+  }
+
+  // =====================================================
+  // Field info / picklists
+  // =====================================================
+
+  async getFieldInfo(entityType: string): Promise<FieldInfo[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting field info for entity: ${entityType}`);
+      const { fields: rawFields } = await http.fieldInfo(entityType);
+      return rawFields.map((field: any): FieldInfo => ({
+        name: field.name,
+        dataType: field.dataType,
+        length: field.length,
+        isRequired: field.isRequired || false,
+        isReadOnly: field.isReadOnly || false,
+        isQueryable: field.isQueryable || false,
+        isReference: field.isReference || false,
+        referenceEntityType: field.referenceEntityType,
+        isPickList: field.isPickList || false,
+        picklistValues: field.picklistValues?.map((pv: any): PicklistValue => {
+          const out: PicklistValue = {
+            value: String(pv.value),
+            label: pv.label || pv.name || String(pv.value),
+            isDefaultValue: pv.isDefaultValue || false,
+            sortOrder: pv.sortOrder,
+            isActive: pv.isActive !== false,
+            isSystem: pv.isSystem || false,
+          };
+          if (pv.parentValue) out.parentValue = String(pv.parentValue);
+          return out;
+        }),
+        picklistParentValueField: field.picklistParentValueField,
+      }));
+    } catch (error) {
+      this.logger.error(`Failed to get field info for ${entityType}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Company Site Configurations
+  // =====================================================
+
+  async getCompanySiteConfigurations(companyId: number): Promise<any[]> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Getting company site configurations for company ID: ${companyId}`);
+      return await http.query<any>(
+        'CompanySiteConfigurations',
+        [{ op: 'eq', field: 'companyID', value: companyId }],
+        { maxRecords: 100 }
+      );
+    } catch (error) {
+      this.logger.error(`Failed to get company site configurations for company ${companyId}:`, error);
+      throw error;
+    }
+  }
+
+  async updateCompanySiteConfiguration(id: number, updates: Record<string, any>): Promise<void> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Updating company site configuration ${id}:`, updates);
+      await http.update('CompanySiteConfigurations', id, updates);
+      this.logger.info(`Company site configuration ${id} updated successfully`);
+    } catch (error) {
+      this.logger.error(`Failed to update company site configuration ${id}:`, error);
+      throw error;
+    }
+  }
+
+  // =====================================================
+  // Raw REST passthrough (escape hatch)
+  // =====================================================
+
+  async rawRequest<T = any>(
+    method: string,
+    path: string,
+    body?: any,
+    queryParams?: Record<string, string | number | boolean>
+  ): Promise<T> {
+    const http = await this.ensureClient();
+    try {
+      this.logger.debug(`Raw Autotask request ${method} ${path}`, { hasBody: body !== undefined, queryParams });
+      return await http.rawRequest<T>(method, path, body, queryParams);
+    } catch (error) {
+      this.logger.error(`Raw Autotask request ${method} ${path} failed:`, error);
+      throw error;
+    }
+  }
+}
+
+// resolveAutotaskApiUrl kept referenced to avoid unused-import warnings
+// for tooling that may not see usage inside AutotaskHttpClient (it's used
+// there). This re-export is harmless.
+export { resolveAutotaskApiUrl };
